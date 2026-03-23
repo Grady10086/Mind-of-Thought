@@ -127,6 +127,62 @@ class GridEntity:
     first_seen_frame: int = 0
     count_in_frame: int = 1
     detections: List[Dict] = field(default_factory=list)
+    
+    # === Mind-of-Thought: Belief Probing + Uncertainty Fields ===
+    position_cov: np.ndarray = None      # 3x3 协方差矩阵
+    position_uncertainty: float = 1.0    # 标量 uncertainty
+    size_uncertainty: float = 1.0
+    depth_std_mean: float = 0.0
+    obs_count: int = 0
+    support_frames: List[int] = field(default_factory=list)
+    frame_confidences: Dict[int, float] = field(default_factory=dict)
+    
+    def summarize_detections(self, detections: List[Dict]) -> Optional[Dict]:
+        """
+        Mind-of-Thought: 带权聚合多帧检测结果
+        权重 = confidence / uncertainty^2
+        """
+        if not detections:
+            return None
+        
+        # 计算权重
+        weights = []
+        positions = []
+        sizes = []
+        confidences = []
+        
+        for det in detections:
+            u = max(det.get('position_uncertainty', 1.0), 1e-4)
+            conf = det.get('confidence', 0.5)
+            w = conf / (u ** 2)
+            weights.append(w)
+            positions.append(det['position_3d'])
+            sizes.append(det.get('size_3d', np.array([0.1, 0.1, 0.1])))
+            confidences.append(conf)
+        
+        weights = np.array(weights)
+        positions = np.array(positions)
+        
+        # 加权平均位置
+        total_weight = np.sum(weights)
+        if total_weight < 1e-6:
+            return None
+        
+        mean_pos = np.sum(positions * weights[:, None], axis=0) / total_weight
+        
+        # 加权协方差
+        diff = positions - mean_pos
+        cov = np.dot(diff.T * weights, diff) / total_weight
+        
+        # 标量 uncertainty (trace of cov)
+        scalar_unc = float(np.trace(cov)) + 1e-4
+        
+        return {
+            'position_3d': mean_pos,
+            'position_cov': cov,
+            'position_uncertainty': scalar_unc,
+            'confidence': float(np.mean(confidences)),
+        }
 
 
 class Grid64:
@@ -660,13 +716,21 @@ class Grid64Builder:
                 depth_region = depth_maps[i, y1_int:y2_int+1, x1_int:x2_int+1]
                 if depth_region.size > 0:
                     depth = np.median(depth_region)
+                    # Mind-of-Thought: 计算深度区域的 std 作为 uncertainty 指标
+                    valid_depths = depth_region[depth_region > 0.01]
+                    depth_std = float(np.std(valid_depths)) if len(valid_depths) > 1 else 1.0
                 else:
                     cx_int = int((x1_int + x2_int) / 2)
                     cy_int = int((y1_int + y2_int) / 2)
                     depth = depth_maps[i, cy_int, cx_int]
+                    depth_std = 1.0  # 回退到高 uncertainty
                 
                 if depth < 0.01:
                     continue
+                
+                # Mind-of-Thought: 计算 position_uncertainty
+                # u = 0.5 * depth_std + 0.5 * (1.0 - confidence)
+                position_uncertainty = 0.5 * depth_std + 0.5 * (1.0 - float(conf))
                 
                 # 像素 → 相机坐标
                 center_u = (bbox_scaled[0] + bbox_scaled[2]) / 2
@@ -700,6 +764,9 @@ class Grid64Builder:
                     'width_3d': float(w_3d),
                     'height_3d': float(h_3d),
                     'depth_value': float(depth),  # v4: 保存深度用于distance_scale校准
+                    # Mind-of-Thought: 添加 uncertainty 信息
+                    'depth_std': depth_std,
+                    'position_uncertainty': position_uncertainty,
                 })
         
         # 6. 聚合 → 先收集所有Entity的3D位置
@@ -743,15 +810,40 @@ class Grid64Builder:
         # 用中位数帧计数（比max更鲁棒，抑制32帧下少数帧过度检测导致的overcount）
         max_count = max(1, int(np.median(counts_per_frame)))
         
-        # 去重: 不同帧中位置接近的检测可能是同一物体
-        # 使用中位数聚合位置
-        positions = np.array([d['position_3d'] for d in detections])
-        avg_pos = np.median(positions, axis=0)
+        # Mind-of-Thought: 使用 summarize_detections 进行带权聚合
+        # 创建临时 entity 来调用 summarize_detections
+        temp_entity = GridEntity(
+            entity_id="temp",
+            category=label,
+            grid_position=(0, 0, 0),
+            position_3d=np.array([0.0, 0.0, 0.0]),
+            detections=detections,
+        )
+        summary = temp_entity.summarize_detections(detections)
         
-        avg_conf = np.mean([d['confidence'] for d in detections])
+        if summary is None:
+            # 回退到原始中位数方法
+            positions = np.array([d['position_3d'] for d in detections])
+            avg_pos = np.median(positions, axis=0)
+            avg_conf = np.mean([d['confidence'] for d in detections])
+            position_uncertainty = 1.0
+            position_cov = None
+        else:
+            avg_pos = summary['position_3d']
+            avg_conf = summary['confidence']
+            position_uncertainty = summary['position_uncertainty']
+            position_cov = summary['position_cov']
+        
         best_det = max(detections, key=lambda x: x['confidence'])
         size_3d = np.array([best_det['width_3d'], best_det['height_3d'], 0.3])
         first_frame = min(d['frame_idx'] for d in detections)
+        
+        # 计算平均 depth_std
+        depth_std_mean = np.mean([d.get('depth_std', 1.0) for d in detections])
+        
+        # 收集 support frames 和 frame confidences
+        support_frames = sorted(set(d['frame_idx'] for d in detections))
+        frame_confidences = {d['frame_idx']: d['confidence'] for d in detections}
         
         # 检查位置有效性
         if np.any(np.isnan(avg_pos)) or np.any(np.isinf(avg_pos)):
@@ -770,6 +862,13 @@ class Grid64Builder:
             first_seen_frame=first_frame,
             count_in_frame=max_count,
             detections=detections,
+            # Mind-of-Thought: 添加 uncertainty 字段
+            position_cov=position_cov,
+            position_uncertainty=position_uncertainty,
+            depth_std_mean=float(depth_std_mean),
+            obs_count=len(detections),
+            support_frames=support_frames,
+            frame_confidences=frame_confidences,
         )
 
     def search_and_add_entity(self, grid: Grid64, entity_name: str) -> Optional[GridEntity]:

@@ -424,6 +424,12 @@ class ToolExecutionContext:
         self.builder = builder; self.question = question; self.options = options
         self.question_type = question_type
         self.tool_trace = []; self.vl_calls = 0; self._final_answer = None
+        
+        # === Mind-of-Thought: Belief Probing + Uncertainty Tracking ===
+        self.belief_probe_history = []      # List of belief snapshots
+        self.focused_frame_history = []     # Track which frames were selected
+        self.uncertainty_history = []       # Track uncertainty evolution
+        self.query_entities = []            # Entities mentioned in question
 
 
 def _extract_question_entities(question, options):
@@ -994,43 +1000,210 @@ def _compute_choice_confidence(model, processor, inputs):
 
 
 # ============================================================================
+# Mind-of-Thought: Belief Probing + Uncertainty-Guided Evolution
+# ============================================================================
+
+def _entity_uncertainty(ent):
+    """提取 entity 的标量 uncertainty"""
+    if hasattr(ent, 'position_uncertainty') and ent.position_uncertainty is not None:
+        return ent.position_uncertainty
+    return 1.0  # 默认高 uncertainty
+
+def _mean_query_uncertainty(ctx, rel_names):
+    """计算问题相关 entities 的平均 uncertainty"""
+    uncertainties = []
+    for name in rel_names:
+        found = ctx.grid.get_by_category(name)
+        if found:
+            uncertainties.append(_entity_uncertainty(found[0]))
+    if not uncertainties:
+        return 1.0
+    return float(np.mean(uncertainties))
+
+def _probe_belief(ctx, stage, rel_names):
+    """
+    Mind-of-Thought: Belief Probing
+    记录当前belief状态到 probe_history
+    """
+    snapshot = {
+        'stage': stage,
+        'entities': {},
+        'relations': {},
+        'uncertainty': {},
+    }
+    
+    # 记录相关 entities
+    for name in rel_names:
+        found = ctx.grid.get_by_category(name)
+        if found:
+            e = found[0]
+            snapshot['entities'][name] = {
+                'position': e.position_3d.tolist() if e.position_3d is not None else None,
+                'confidence': e.confidence,
+                'uncertainty': _entity_uncertainty(e),
+                'obs_count': getattr(e, 'obs_count', len(e.detections)),
+                'support_frames': getattr(e, 'support_frames', []),
+            }
+    
+    # 计算平均 uncertainty
+    snapshot['mean_uncertainty'] = _mean_query_uncertainty(ctx, rel_names)
+    
+    ctx.belief_probe_history.append(snapshot)
+    return snapshot
+
+def _detection_noise_score(entity, detection):
+    """
+    计算单个 detection 的 noise score (越高越 noisy)
+    score = uncertainty + 0.5 * mahalanobis_distance + 0.3 * (1 - confidence)
+    """
+    unc = detection.get('position_uncertainty', 1.0)
+    conf = detection.get('confidence', 0.5)
+    
+    # Mahalanobis distance (简化为相对于 entity 位置的 z-score)
+    det_pos = detection.get('position_3d')
+    ent_pos = entity.position_3d if entity.position_3d is not None else det_pos
+    
+    if det_pos is not None and ent_pos is not None:
+        diff = np.array(det_pos) - np.array(ent_pos)
+        # 简化的 mahalanobis: 使用 entity 的协方差或单位矩阵
+        if hasattr(entity, 'position_cov') and entity.position_cov is not None:
+            try:
+                cov_inv = np.linalg.inv(entity.position_cov + np.eye(3) * 1e-4)
+                mahal = float(np.sqrt(diff.T @ cov_inv @ diff))
+            except:
+                mahal = float(np.linalg.norm(diff))
+        else:
+            mahal = float(np.linalg.norm(diff))
+    else:
+        mahal = 0.0
+    
+    score = unc + 0.5 * mahal + 0.3 * (1.0 - conf)
+    return score
+
+def _refresh_entity_from_detections(ctx, entity, detections):
+    """用 summarize_detections 重新计算 entity 属性"""
+    summary = entity.summarize_detections(detections)
+    if summary is not None:
+        entity.position_3d = summary['position_3d']
+        entity.position_cov = summary['position_cov']
+        entity.position_uncertainty = summary['position_uncertainty']
+        entity.confidence = summary['confidence']
+        entity.detections = detections
+        entity.obs_count = len(detections)
+        entity.support_frames = sorted(set(d['frame_idx'] for d in detections))
+        entity.grid_position = ctx.grid.world_to_grid(entity.position_3d)
+        return True
+    return False
+
+def _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal):
+    """
+    Mind-of-Thought: Uncertainty-Guided Frame Selection
+    score = relevance × uncertainty × novelty
+    """
+    scored = []
+    
+    # 获取 entity frames mapping
+    entity_frames = {}
+    entity_uncertainties = {}
+    for name in rel_names:
+        found = ctx.grid.get_by_category(name)
+        if found:
+            e = found[0]
+            entity_uncertainties[name] = _entity_uncertainty(e)
+            # 获取该 entity 出现的 frames
+            if hasattr(e, 'support_frames'):
+                entity_frames[name] = set(e.support_frames)
+            else:
+                entity_frames[name] = set(d.get('frame_idx', 0) for d in e.detections)
+    
+    for frame in frames:
+        # Relevance: 该 frame 中有多少 query entities 可见
+        visible_entities = [name for name, ent_frames in entity_frames.items() 
+                           if frame in ent_frames]
+        relevance_score = len(visible_entities)
+        
+        # Uncertainty: 可见 entities 的平均 uncertainty
+        if visible_entities:
+            uncertainty_score = np.mean([entity_uncertainties.get(name, 1.0) 
+                                        for name in visible_entities])
+        else:
+            uncertainty_score = 0.5
+        
+        # Novelty: 不在 prev_frames 中得高分
+        novelty_score = 1.0 if frame not in prev_frames else 0.3
+        
+        # 综合 score
+        score = relevance_score * uncertainty_score * novelty_score
+        scored.append((frame, score))
+    
+    # 按 score 降序排序
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [f for f, s in scored]
+
+
+# ============================================================================
 # V21 CORE: Confidence-Aware Self-Evolution Loop (Choice Tasks)
 # ============================================================================
 
 def _evolve_belief(ctx, rel_names, std_threshold, rp):
-    """Evolve Grid belief by filtering high-variance/low-confidence detections.
-    Returns True if any entity was modified."""
+    """
+    Mind-of-Thought: Detection Noise Score Evolution
+    使用 uncertainty + mahalanobis + confidence 综合 score
+    保守策略：只删除 top-m noisy detections, m = max(1, min(2, n//4))
+    Returns True if any entity was modified.
+    """
     modified = False
     for name in rel_names:
         found = ctx.grid.get_by_category(name)
         if not found: continue
         e = found[0]
         if not e.detections or len(e.detections) < 4: continue
-        positions = np.array([d['position_3d'] for d in e.detections if 'position_3d' in d])
-        if len(positions) < 3: continue
-        pos_std = float(np.mean(np.std(positions, axis=0)))
-        if pos_std > std_threshold:
-            ds = sorted(e.detections, key=lambda d: d.get('confidence', 0))
-            nr = max(1, len(ds) // 3)
-            bf = [d.get('frame_order', -1) for d in ds[:nr]]
-            bf = [f for f in bf if f >= 0]
-            if bf:
-                r = evolutor_tool(ctx, 'FILTER_FRAMES', f"{name}:{','.join(str(f) for f in bf)}")
-                if 'removed' in r:
-                    modified = True
-                    rp.append(f"[filter] {name}: {r[:50]}")
-                    logger.info(f"    evolve: {r}")
+        
+        # 计算所有 detections 的 noise score
+        scored_dets = [(det, _detection_noise_score(e, det)) for det in e.detections]
+        
+        # 按 noise score 降序排列（高 score = 高 noise）
+        scored_dets.sort(key=lambda x: x[1], reverse=True)
+        
+        # 保守删除策略：最多删 2 个，最少 1 个
+        n = len(scored_dets)
+        m = max(1, min(2, n // 4))  # 保守: 25% 但最多 2 个
+        
+        to_remove = scored_dets[:m]
+        if to_remove:
+            # 从 detections 中移除
+            remove_set = set(id(det) for det, _ in to_remove)
+            new_detections = [det for det in e.detections if id(det) not in remove_set]
+            
+            if len(new_detections) < len(e.detections):
+                # 刷新 entity
+                _refresh_entity_from_detections(ctx, e, new_detections)
+                modified = True
+                rp.append(f"[evolve] {name}: removed {len(to_remove)} noisy dets, unc={e.position_uncertainty:.3f}")
+                logger.info(f"    evolve: {name} removed {len(to_remove)} noisy detections")
     return modified
 
 
-def _select_frames(ctx, is_temporal):
-    """Select focused frames from current Grid state."""
+def _select_frames(ctx, is_temporal, prev_frames=None):
+    """
+    Select focused frames from current Grid state.
+    Mind-of-Thought: 使用 uncertainty-guided scoring
+    """
+    prev_frames = prev_frames or set()
+    
     if is_temporal:
         frames, ents = _get_entity_union_frames(ctx.grid, ctx.question, ctx.options)
         ftype = 'temporal'
     else:
         frames, ents = _get_cooccurrence_frames(ctx.grid, ctx.question, ctx.options)
         ftype = 'cooccur'
+    
+    # Mind-of-Thought: 如果有 frames，使用 uncertainty-guided scoring
+    if frames and len(frames) > 1:
+        rel_names = _extract_question_entities(ctx.question, ctx.options)
+        sorted_frames = _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal)
+        return sorted_frames, ents, ftype
+    
     return frames, ents, ftype
 
 
@@ -1106,16 +1279,14 @@ def _vl_on_frames_conf(ctx, frames, ents, ftype, is_temporal, rp, round_id, abcd
 
 
 def v21_loop(ctx, max_rounds=3, abcd_ids=None):
-    """V21: V20 + Confidence-Aware Consensus Breaking.
+    """
+    V21 + Mind-of-Thought: Belief Probing + Uncertainty-Guided Evolution
 
-    Same as V20 except:
-    - P1 global VL call also gets logit confidence
-    - Each focused VL call also gets logit confidence
-    - When global==focused (consensus), check avg_conf:
-      If avg_conf >= CONFIDENCE_THRESHOLD → trust (confident consensus)
-      If avg_conf < CONFIDENCE_THRESHOLD → DON'T trust, continue evolving
-    - Final vote uses confidence weighting
-    - Numerical tasks: unchanged (same proven V17 path)
+    Key additions:
+    - Belief probing at P0, pre/post evolution, and final
+    - Uncertainty-guided frame selection
+    - Detection noise score evolution (conservative filtering)
+    - Uncertainty-aware stopping condition
     """
     rp = []
     ct = _auto_coder_type(ctx.question, ctx.options) or ''
@@ -1126,9 +1297,13 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 
     is_temporal = _is_temporal_question(ctx.question)
     rel_names = _extract_question_entities(ctx.question, ctx.options)
+    ctx.query_entities = rel_names  # 记录 query entities
 
     # ──── Phase 0: Build Belief (hidden from VL) ────
     rp.append("[P0:belief]")
+
+    # Mind-of-Thought: P0 Belief Probing
+    _probe_belief(ctx, 'P0_init', rel_names)
 
     cr = coder_tool(ctx, ct) if ct else ''
     if cr and 'not found' in cr.lower():
@@ -1153,6 +1328,7 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 
     # ──── Iterative Evolution Loop ────
     std_thresholds = [0.4, 0.3, 0.2, 0.15, 0.1]
+    stop_threshold = 0.35  # Mind-of-Thought: uncertainty 停止阈值
 
     vl_history = [('global', vl_global, conf_g)]  # (source, answer, confidence)
     prev_frames = set()
@@ -1164,21 +1340,40 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
         rp.append(f"[R{round_id}]")
         logger.info(f"  Round {round_id}/{max_rounds}")
 
-        # 1. Select frames from current Grid state
-        frames, ents, ftype = _select_frames(ctx, is_temporal)
+        # 1. Select frames from current Grid state (with uncertainty guidance)
+        frames, ents, ftype = _select_frames(ctx, is_temporal, prev_frames)
         cur_frames = set(frames) if frames else set()
+        ctx.focused_frame_history.append(list(cur_frames))
 
-        # 2. New info check
+        # Mind-of-Thought: Pre-selection uncertainty
+        pre_unc = _mean_query_uncertainty(ctx, rel_names)
+
+        # 2. New info check (Mind-of-Thought: 添加 uncertainty-aware 停止)
         if round_id > 1 and cur_frames == prev_frames:
-            rp.append(f"[R{round_id}:no_new_frames]")
-            logger.info(f"    R{round_id}: frames unchanged → stop")
-            break
+            # 检查 uncertainty 是否足够低
+            if pre_unc < stop_threshold:
+                converge_type = 'uncertainty_threshold'
+                rp.append(f"[R{round_id}:uncertainty_stop] unc={pre_unc:.3f} < {stop_threshold}")
+                logger.info(f"    R{round_id}: frames unchanged & uncertainty low → stop")
+                break
+            else:
+                rp.append(f"[R{round_id}:no_new_frames_high_unc] unc={pre_unc:.3f}")
+                logger.info(f"    R{round_id}: frames unchanged but unc={pre_unc:.3f} → continue")
 
         # 3. VL judges on focused frames WITH CONFIDENCE
         vl_ans, vl_conf, _ = _vl_on_frames_conf(
             ctx, frames, ents, ftype, is_temporal, rp, round_id, abcd_ids)
         vl_history.append((f'R{round_id}', vl_ans, vl_conf))
         n_rounds = round_id
+
+        # Mind-of-Thought: Post-VL uncertainty
+        post_unc = _mean_query_uncertainty(ctx, rel_names)
+        ctx.uncertainty_history.append({
+            'round': round_id,
+            'pre_uncertainty': pre_unc,
+            'post_uncertainty': post_unc,
+            'mean_query_uncertainty': post_unc,
+        })
 
         # 4. CONFIDENCE-AWARE convergence check
         # (a) Global consensus: focused agrees with anchor
@@ -1195,7 +1390,13 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
                 rp.append(f"[R{round_id}:weak_consensus_skip] {vl_ans} avg_conf={avg_conf:.2f} < {CONFIDENCE_THRESHOLD}")
                 logger.info(f"    R{round_id}: WEAK CONSENSUS {vl_ans} (avg_conf={avg_conf:.2f}) → continue evolving")
                 threshold = std_thresholds[min(round_id - 1, len(std_thresholds) - 1)]
+                
+                # Mind-of-Thought: Pre-evolution probe
+                _probe_belief(ctx, f'R{round_id}_pre_evolve', rel_names)
                 _evolve_belief(ctx, rel_names, threshold, rp)
+                # Mind-of-Thought: Post-evolution probe
+                _probe_belief(ctx, f'R{round_id}_post_evolve', rel_names)
+                
                 prev_frames = cur_frames
                 prev_focused_answer = vl_ans
                 continue
@@ -1212,7 +1413,13 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
         rp.append(f"[R{round_id}:evolve] std_th={threshold:.1f}")
         logger.info(f"    R{round_id}: evolving belief (std_threshold={threshold})")
 
+        # Mind-of-Thought: Pre-evolution probe
+        _probe_belief(ctx, f'R{round_id}_pre_evolve', rel_names)
+        
         belief_changed = _evolve_belief(ctx, rel_names, threshold, rp)
+        
+        # Mind-of-Thought: Post-evolution probe
+        _probe_belief(ctx, f'R{round_id}_post_evolve', rel_names)
 
         if not belief_changed:
             rp.append(f"[R{round_id}:belief_stable]")
@@ -1220,6 +1427,9 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 
         prev_frames = cur_frames
         prev_focused_answer = vl_ans
+
+    # Mind-of-Thought: Final belief probe
+    _probe_belief(ctx, 'final', rel_names)
 
     # ──── Final Decision — confidence-weighted ────
     all_valid = [(ans, i, conf) for i, (src, ans, conf) in enumerate(vl_history) if ans in 'ABCD']
@@ -1233,6 +1443,12 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
         ans = prev_focused_answer
         rp.append(f"[final:evolution_stable_R{n_rounds}] {ans} (global={vl_global})")
         logger.info(f"  Final: evolution stable at R{n_rounds} → {ans} (global was {vl_global})")
+
+    elif converge_type == 'uncertainty_threshold':
+        # Mind-of-Thought: uncertainty-based convergence
+        ans = prev_focused_answer if prev_focused_answer else vl_global
+        rp.append(f"[final:uncertainty_threshold_R{n_rounds}] {ans}")
+        logger.info(f"  Final: uncertainty threshold at R{n_rounds} → {ans}")
 
     elif not all_valid:
         ans = 'A'
@@ -1305,6 +1521,13 @@ class AgenticPipelineV21:
             cu = any(x.get('tool') == 'coder' for x in ctx.tool_trace)
             gm = any(x.get('tool') == 'evolutor' for x in ctx.tool_trace)
 
+            # Mind-of-Thought: 计算 uncertainty reduction
+            uncertainty_reduction = 0.0
+            if ctx.uncertainty_history:
+                first_unc = ctx.uncertainty_history[0].get('mean_query_uncertainty', 1.0)
+                last_unc = ctx.uncertainty_history[-1].get('mean_query_uncertainty', first_unc)
+                uncertainty_reduction = first_unc - last_unc
+
             results.append({
                 'scene_name': sample.get('scene_name', ''),
                 'question_type': qt, 'question': q, 'ground_truth': gt,
@@ -1316,15 +1539,23 @@ class AgenticPipelineV21:
                 'converged_phase': int(re.search(r'rounds=(\d+)', reasoning).group(1)) if re.search(r'rounds=(\d+)', reasoning) else 0,
                 'converge_type': ('global_consensus_confident' if 'confident_consensus' in reasoning
                                   else ('evolution_stable' if 'evolution_stable' in reasoning
+                                  else ('uncertainty_threshold' if 'uncertainty_threshold' in reasoning
                                   else ('conf_weighted_vote' if 'conf_weighted_vote' in reasoning
-                                  else 'early'))),
-                'converged': 'confident_consensus' in reasoning or 'evolution_stable' in reasoning,
+                                  else 'early')))),
+                'converged': 'confident_consensus' in reasoning or 'evolution_stable' in reasoning or 'uncertainty_threshold' in reasoning,
                 'vl_calls': ctx.vl_calls, 'elapsed_s': round(elapsed, 1),
                 'tool_trace': [{'tool': e.get('tool'), 'action': e.get('action', ''),
                                'ok': e.get('ok', ''), 'n_issues': e.get('n_issues', '')}
                               for e in ctx.tool_trace],
                 'v7_vl_score': sample.get('vl_score', 0),
                 'v7_rule_score': sample.get('rule_score', 0),
+                # Mind-of-Thought: 新增字段
+                'belief_probe_history': ctx.belief_probe_history,
+                'focused_frame_history': ctx.focused_frame_history,
+                'uncertainty_history': ctx.uncertainty_history,
+                'mean_query_uncertainty': ctx.uncertainty_history[-1]['mean_query_uncertainty'] if ctx.uncertainty_history else 1.0,
+                'uncertainty_reduction': uncertainty_reduction,
+                'query_entities': ctx.query_entities,
             })
 
             logger.info(f"  [{qt}] ans={ans} gt={gt} score={score:.3f} "
