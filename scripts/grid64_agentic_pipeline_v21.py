@@ -66,6 +66,12 @@ from scripts.grid64_real_test import (
     grid_answer_appearance_order, grid_answer_route,
 )
 
+# Import Unified System
+USE_UNIFIED = os.environ.get('USE_UNIFIED', 'false').lower() == 'true'
+if USE_UNIFIED:
+    from scripts.grid64_unified_pipeline import unified_grid_answer, detect_task_type
+    logger.info("[V21] Unified System enabled via USE_UNIFIED=true")
+
 
 # ============================================================================
 # Grid256 + fps-based builder (same as V17/V18)
@@ -259,9 +265,17 @@ class VLModel:
                 self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
             elif 'qwen3' in lp or 'Qwen3' in model_path:
-                from transformers import Qwen3VLForConditionalGeneration
-                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
+                try:
+                    # Try Qwen3VL first (newer transformers)
+                    from transformers import Qwen3VLForConditionalGeneration
+                    self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
+                except ImportError:
+                    # Fall back to AutoModelForImageTextToText (older transformers)
+                    logger.warning("Qwen3VLForConditionalGeneration not available, using AutoModelForImageTextToText")
+                    from transformers import AutoModelForImageTextToText
+                    self.model = AutoModelForImageTextToText.from_pretrained(
+                        model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
             else:
                 from transformers import Qwen2_5_VLForConditionalGeneration
                 self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -464,6 +478,16 @@ def _extract_question_entities(question, options):
 def coder_tool(ctx, computation, **kwargs):
     grid = ctx.grid; c = computation.strip().lower()
     try:
+        # Try Unified System first if enabled
+        if USE_UNIFIED and c in ['direction', 'rel_distance', 'appearance_order', 'route']:
+            try:
+                p, r = unified_grid_answer(grid, ctx.question, ctx.options, ctx.vl, ctx.video_path)
+                ctx.tool_trace.append({'tool':'coder','comp':c,'result':p,'unified':True})
+                return f"{c.capitalize()} (Unified): answer={p}, detail={r}"
+            except Exception as ue:
+                logger.warning(f"Unified system failed for {c}: {ue}, falling back to original")
+        
+        # Original implementations
         if c == 'direction':
             p, r = grid_answer_direction(grid, ctx.question, ctx.options)
             ctx.tool_trace.append({'tool':'coder','comp':c,'result':p}); return f"Direction: answer={p}, detail={r}"
@@ -498,7 +522,7 @@ def coder_tool(ctx, computation, **kwargs):
             p, r = grid_answer_route(grid, ctx.question, ctx.options)
             ctx.tool_trace.append({'tool':'coder','comp':c,'result':p}); return f"Route: answer={p}, detail={r}"
         else: return f"Unknown '{c}'"
-    except Exception as e: return f"Coder error ({c}): {e}"
+    except Exception as e: return f"Coder error ({c}): {e}"  
 
 
 def evolutor_tool(ctx, action, target):
@@ -1645,7 +1669,7 @@ def main():
         vis = os.environ.get('CUDA_VISIBLE_DEVICES', '')
         args.device = 'cuda:0' if vis else f'cuda:{args.gpu_id}'
 
-    v7_path = PROJECT_ROOT / "outputs" / "evolving_agent_v7_20260203_134612" / "detailed_results.json"
+    v7_path = Path("/home/tione/notebook/tianjungu/projects/Spatial-Intelligence-MindCube/outputs/evolving_agent_v7_20260203_134612/detailed_results.json")
     logger.info(f"Loading V7: {v7_path}")
     with open(v7_path) as f: v7_results = json.load(f)
     logger.info(f"V7: {len(v7_results)} samples")
