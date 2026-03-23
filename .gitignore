@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data & Models
+data/
+hf_cache/
+*.tar.gz
+*.mp4
+*.glb
+*.ply
+*.npz
+*.parquet
+
+# Outputs
+outputs/
+logs/
+*.log
+checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files
+*.bin
+*.safetensors
+*.pth
+*.pt
+*.ckpt
