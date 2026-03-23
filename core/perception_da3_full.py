@@ -31,7 +31,7 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 # 添加 DA3 路径
-DA3_PATH = Path(__file__).parent.parent.parent / "Depth-Anything-3"
+DA3_PATH = Path(__file__).parent.parent.parent / "projects" / "Depth-Anything-3"
 if str(DA3_PATH) not in sys.path:
     sys.path.insert(0, str(DA3_PATH / "src"))
 
