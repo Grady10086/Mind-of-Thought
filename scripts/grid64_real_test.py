@@ -39,6 +39,11 @@ os.environ['MIOPEN_LOG_LEVEL'] = '1'
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# 添加 DA3 路径
+DA3_ROOT = PROJECT_ROOT / "projects" / "Depth-Anything-3"
+sys.path.insert(0, str(DA3_ROOT))
+sys.path.insert(0, str(DA3_ROOT / "src"))
+
 # 固定随机种子以确保DA3输出可重复
 np.random.seed(42)
 torch.manual_seed(42)
