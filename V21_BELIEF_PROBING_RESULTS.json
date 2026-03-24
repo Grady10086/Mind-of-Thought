@@ -1,0 +1,57 @@
+{
+  "total_samples": 5130,
+  "correct": 2145,
+  "accuracy": 0.41812865497076024,
+  "by_task_type": {
+    "object_abs_distance": {
+      "correct": 432,
+      "total": 834,
+      "accuracy": 0.5179856115107914
+    },
+    "object_rel_direction_hard": {
+      "correct": 156,
+      "total": 373,
+      "accuracy": 0.41823056300268097
+    },
+    "object_rel_distance": {
+      "correct": 336,
+      "total": 710,
+      "accuracy": 0.4732394366197183
+    },
+    "object_size_estimation": {
+      "correct": 0,
+      "total": 953,
+      "accuracy": 0.0
+    },
+    "object_rel_direction_easy": {
+      "correct": 124,
+      "total": 217,
+      "accuracy": 0.5714285714285714
+    },
+    "object_counting": {
+      "correct": 485,
+      "total": 565,
+      "accuracy": 0.8584070796460177
+    },
+    "room_size_estimation": {
+      "correct": 16,
+      "total": 288,
+      "accuracy": 0.05555555555555555
+    },
+    "obj_appearance_order": {
+      "correct": 361,
+      "total": 618,
+      "accuracy": 0.5841423948220065
+    },
+    "object_rel_direction_medium": {
+      "correct": 178,
+      "total": 378,
+      "accuracy": 0.4708994708994709
+    },
+    "route_planning": {
+      "correct": 57,
+      "total": 194,
+      "accuracy": 0.29381443298969073
+    }
+  }
+}
