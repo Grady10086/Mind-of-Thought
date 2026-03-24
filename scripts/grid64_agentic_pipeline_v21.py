@@ -1112,6 +1112,9 @@ def _refresh_entity_from_detections(ctx, entity, detections):
         entity.position_cov = summary['position_cov']
         entity.position_uncertainty = summary['position_uncertainty']
         entity.confidence = summary['confidence']
+        # 修复: 更新 size_3d
+        if 'size_3d' in summary:
+            entity.size_3d = summary['size_3d']
         entity.detections = detections
         entity.obs_count = len(detections)
         entity.support_frames = sorted(set(d['frame_idx'] for d in detections))

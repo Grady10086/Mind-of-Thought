@@ -182,11 +182,16 @@ class GridEntity:
         # 标量 uncertainty (trace of cov)
         scalar_unc = float(np.trace(cov)) + 1e-4
         
+        # 加权平均 size_3d
+        sizes = np.array(sizes)
+        mean_size = np.sum(sizes * weights[:, None], axis=0) / total_weight
+        
         return {
             'position_3d': mean_pos,
             'position_cov': cov,
             'position_uncertainty': scalar_unc,
             'confidence': float(np.mean(confidences)),
+            'size_3d': mean_size,
         }
 
 
