@@ -3,13 +3,13 @@
 64³ Grid Mind Map 真实小样本测试
 
 核心流程:
-1. 从V7基准结果(VL=63.61%)中选取样本(每种任务类型各选一些)
+1. 从参考评测样本中选取问题(每种任务类型各选一些)
 2. 对每个样本视频: DA3多视图推理 → 获取绝对深度+内外参
 3. GroundingDINO检测 → 反投影到世界坐标 → 构建64³ Grid
 4. Grid工具确定性回答所有问题
-5. 对比 Grid工具 vs V7 VL(63.61%)
+5. 对比 Grid工具 vs 参考 VL 分数
 
-对比基准: outputs/evolving_agent_v7_20260203_134612/ (VL Overall = 63.61%)
+对比基准: data/eval_samples_v7_reference.json (包含参考 VL / Rule 分数)
 """
 
 import os
@@ -29,20 +29,14 @@ from collections import defaultdict, Counter
 from datetime import datetime
 
 # ============================================================================
-# 环境配置
+# Runtime configuration
 # ============================================================================
-os.environ['HF_HOME'] = '/home/tione/notebook/tianjungu/hf_cache'
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ['MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK'] = '1'
-os.environ['MIOPEN_LOG_LEVEL'] = '1'
-
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# 添加 DA3 路径
-DA3_ROOT = PROJECT_ROOT / "projects" / "Depth-Anything-3"
-sys.path.insert(0, str(DA3_ROOT))
-sys.path.insert(0, str(DA3_ROOT / "src"))
+from runtime_config import ensure_runtime_env, get_video_dirs, resolve_eval_manifest, resolve_grounding_dino_model
+
+ensure_runtime_env()
 
 # 固定随机种子以确保DA3输出可重复
 np.random.seed(42)
@@ -53,12 +47,12 @@ if torch.cuda.is_available():
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 视频目录
-VIDEO_DIRS = [
-    '/home/tione/notebook/tianjungu/projects/ms-swift/tianjungu/projects/ms-swift/run_sft_deepspeed.sh/vsibench/arkitscenes',
-    '/home/tione/notebook/tianjungu/projects/ms-swift/tianjungu/projects/ms-swift/run_sft_deepspeed.sh/vsibench/scannet',
-    '/home/tione/notebook/tianjungu/projects/ms-swift/tianjungu/projects/ms-swift/run_sft_deepspeed.sh/vsibench/scannetpp',
-]
+VIDEO_DIRS = get_video_dirs()
+
+
+def set_video_dirs(video_dirs: Optional[List[str]] = None):
+    global VIDEO_DIRS
+    VIDEO_DIRS = get_video_dirs(video_dirs)
 
 # 扩展词汇表 (v6: 覆盖VSIBench中常见物体 + 缺失实体补充)
 # GroundingDINO prompt有长度限制，分批检测（每批≤30词）
@@ -132,67 +126,14 @@ class GridEntity:
     first_seen_frame: int = 0
     count_in_frame: int = 1
     detections: List[Dict] = field(default_factory=list)
-    
     # === Mind-of-Thought: Belief Probing + Uncertainty Fields ===
     position_cov: np.ndarray = None      # 3x3 协方差矩阵
-    position_uncertainty: float = 1.0    # 标量 uncertainty
-    size_uncertainty: float = 1.0
-    depth_std_mean: float = 0.0
-    obs_count: int = 0
-    support_frames: List[int] = field(default_factory=list)
-    frame_confidences: Dict[int, float] = field(default_factory=dict)
-    
-    def summarize_detections(self, detections: List[Dict]) -> Optional[Dict]:
-        """
-        Mind-of-Thought: 带权聚合多帧检测结果
-        权重 = confidence / uncertainty^2
-        """
-        if not detections:
-            return None
-        
-        # 计算权重
-        weights = []
-        positions = []
-        sizes = []
-        confidences = []
-        
-        for det in detections:
-            u = max(det.get('position_uncertainty', 1.0), 1e-4)
-            conf = det.get('confidence', 0.5)
-            w = conf / (u ** 2)
-            weights.append(w)
-            positions.append(det['position_3d'])
-            sizes.append(det.get('size_3d', np.array([0.1, 0.1, 0.1])))
-            confidences.append(conf)
-        
-        weights = np.array(weights)
-        positions = np.array(positions)
-        
-        # 加权平均位置
-        total_weight = np.sum(weights)
-        if total_weight < 1e-6:
-            return None
-        
-        mean_pos = np.sum(positions * weights[:, None], axis=0) / total_weight
-        
-        # 加权协方差
-        diff = positions - mean_pos
-        cov = np.dot(diff.T * weights, diff) / total_weight
-        
-        # 标量 uncertainty (trace of cov)
-        scalar_unc = float(np.trace(cov)) + 1e-4
-        
-        # 加权平均 size_3d
-        sizes = np.array(sizes)
-        mean_size = np.sum(sizes * weights[:, None], axis=0) / total_weight
-        
-        return {
-            'position_3d': mean_pos,
-            'position_cov': cov,
-            'position_uncertainty': scalar_unc,
-            'confidence': float(np.mean(confidences)),
-            'size_3d': mean_size,
-        }
+    position_uncertainty: float = 1.0    # 标量 uncertainty 供 selection/stopping/probing
+    size_uncertainty: float = 1.0        # 尺寸 uncertainty
+    depth_std_mean: float = 0.0          # 平均深度标准差
+    obs_count: int = 0                   # 支持该实体的检测数
+    support_frames: List[int] = field(default_factory=list)  # 支持帧列表
+    frame_confidences: Dict[int, float] = field(default_factory=dict)  # 每帧置信度
 
 
 class Grid64:
@@ -597,7 +538,7 @@ class Grid64Builder:
         if self._labeler is None:
             from core.semantic_labeler import GroundingDINOLabeler
             self._labeler = GroundingDINOLabeler(
-                model_id="IDEA-Research/grounding-dino-base",
+                model_id=resolve_grounding_dino_model("IDEA-Research/grounding-dino-base"),
                 device=self.device,
                 box_threshold=0.25,
                 text_threshold=0.25,
@@ -726,21 +667,24 @@ class Grid64Builder:
                 depth_region = depth_maps[i, y1_int:y2_int+1, x1_int:x2_int+1]
                 if depth_region.size > 0:
                     depth = np.median(depth_region)
-                    # Mind-of-Thought: 计算深度区域的 std 作为 uncertainty 指标
+                    # Mind-of-Thought: 计算 depth_std
                     valid_depths = depth_region[depth_region > 0.01]
-                    depth_std = float(np.std(valid_depths)) if len(valid_depths) > 1 else 1.0
+                    if len(valid_depths) > 1:
+                        depth_std = float(np.std(valid_depths))
+                    else:
+                        depth_std = 1.0  # 回退到高 uncertainty
                 else:
                     cx_int = int((x1_int + x2_int) / 2)
                     cy_int = int((y1_int + y2_int) / 2)
                     depth = depth_maps[i, cy_int, cx_int]
-                    depth_std = 1.0  # 回退到高 uncertainty
+                    depth_std = 1.0  # 区域太小，给高 uncertainty
                 
                 if depth < 0.01:
                     continue
                 
                 # Mind-of-Thought: 计算 position_uncertainty
-                # u = 0.5 * depth_std + 0.5 * (1.0 - confidence)
-                position_uncertainty = 0.5 * depth_std + 0.5 * (1.0 - float(conf))
+                # 公式: 0.5 * depth_std + 0.5 * (1.0 - confidence)
+                position_uncertainty = 0.5 * depth_std + 0.5 * (1.0 - conf)
                 
                 # 像素 → 相机坐标
                 center_u = (bbox_scaled[0] + bbox_scaled[2]) / 2
@@ -774,9 +718,8 @@ class Grid64Builder:
                     'width_3d': float(w_3d),
                     'height_3d': float(h_3d),
                     'depth_value': float(depth),  # v4: 保存深度用于distance_scale校准
-                    # Mind-of-Thought: 添加 uncertainty 信息
-                    'depth_std': depth_std,
-                    'position_uncertainty': position_uncertainty,
+                    'depth_std': float(depth_std),  # Mind-of-Thought: 深度标准差
+                    'position_uncertainty': float(position_uncertainty),  # Mind-of-Thought: 位置不确定性
                 })
         
         # 6. 聚合 → 先收集所有Entity的3D位置
@@ -808,7 +751,12 @@ class Grid64Builder:
         logger.info(f"Grid64 built: {len(grid.entities)} entities, mpg={grid.meters_per_grid:.4f}m")
         return grid
     
-    def _aggregate_to_entity(self, grid: Grid64, label: str, detections: List[Dict]) -> Optional[GridEntity]:
+    def summarize_detections(self, detections: List[Dict]) -> Optional[Dict]:
+        """Mind-of-Thought: 统一聚合函数 - 带权聚合计算 uncertainty
+        
+        使用加权平均替代纯 median，权重 = confidence / uncertainty^2
+        输出包含完整的 belief summary，供 _aggregate_to_entity 和 FILTER_FRAMES 使用
+        """
         if not detections:
             return None
         
@@ -817,68 +765,98 @@ class Grid64Builder:
         for det in detections:
             frame_dets[det['frame_idx']].append(det)
         counts_per_frame = [len(fd) for fd in frame_dets.values()]
-        # 用中位数帧计数（比max更鲁棒，抑制32帧下少数帧过度检测导致的overcount）
         max_count = max(1, int(np.median(counts_per_frame)))
         
-        # Mind-of-Thought: 使用 summarize_detections 进行带权聚合
-        # 创建临时 entity 来调用 summarize_detections
-        temp_entity = GridEntity(
-            entity_id="temp",
-            category=label,
-            grid_position=(0, 0, 0),
-            position_3d=np.array([0.0, 0.0, 0.0]),
-            detections=detections,
+        # 收集支持帧和每帧置信度
+        support_frames = sorted(frame_dets.keys())
+        frame_confidences = {frame: np.mean([d['confidence'] for d in frame_dets[frame]]) 
+                            for frame in support_frames}
+        first_frame = min(support_frames) if support_frames else 0
+        
+        # Mind-of-Thought: 带权聚合（权重 = confidence / uncertainty^2）
+        weights = []
+        positions = []
+        depth_stds = []
+        
+        for det in detections:
+            u = max(det.get('position_uncertainty', 1.0), 1e-4)
+            conf = det.get('confidence', 0.5)
+            w = conf / (u ** 2)
+            weights.append(w)
+            positions.append(det['position_3d'])
+            depth_stds.append(det.get('depth_std', 1.0))
+        
+        weights = np.asarray(weights, dtype=float)
+        weights = weights / weights.sum()  # 归一化
+        positions = np.asarray(positions, dtype=float)
+        
+        # 加权平均位置
+        mu = np.sum(weights[:, None] * positions, axis=0)
+        
+        # 计算协方差矩阵
+        centered = positions - mu
+        cov = np.sum(
+            weights[:, None, None] * np.einsum('ni,nj->nij', centered, centered),
+            axis=0
         )
-        summary = temp_entity.summarize_detections(detections)
         
-        if summary is None:
-            # 回退到原始中位数方法
-            positions = np.array([d['position_3d'] for d in detections])
-            avg_pos = np.median(positions, axis=0)
-            avg_conf = np.mean([d['confidence'] for d in detections])
-            position_uncertainty = 1.0
-            position_cov = None
-        else:
-            avg_pos = summary['position_3d']
-            avg_conf = summary['confidence']
-            position_uncertainty = summary['position_uncertainty']
-            position_cov = summary['position_cov']
+        # 标量 uncertainty = sqrt(trace(cov))
+        position_uncertainty = float(np.sqrt(np.trace(cov)))
         
+        # 平均深度标准差
+        depth_std_mean = float(np.mean(depth_stds))
+        
+        # 平均置信度
+        avg_conf = float(np.mean([d['confidence'] for d in detections]))
+        
+        # 尺寸（使用最高置信度检测或加权）
         best_det = max(detections, key=lambda x: x['confidence'])
         size_3d = np.array([best_det['width_3d'], best_det['height_3d'], 0.3])
-        first_frame = min(d['frame_idx'] for d in detections)
-        
-        # 计算平均 depth_std
-        depth_std_mean = np.mean([d.get('depth_std', 1.0) for d in detections])
-        
-        # 收集 support frames 和 frame confidences
-        support_frames = sorted(set(d['frame_idx'] for d in detections))
-        frame_confidences = {d['frame_idx']: d['confidence'] for d in detections}
         
         # 检查位置有效性
-        if np.any(np.isnan(avg_pos)) or np.any(np.isinf(avg_pos)):
+        if np.any(np.isnan(mu)) or np.any(np.isinf(mu)):
             return None
         
-        grid_pos = grid.world_to_grid(avg_pos)
+        return {
+            'position_3d': mu,
+            'position_cov': cov,
+            'position_uncertainty': position_uncertainty,
+            'confidence': avg_conf,
+            'size_3d': size_3d,
+            'depth_std_mean': depth_std_mean,
+            'obs_count': len(detections),
+            'support_frames': support_frames,
+            'frame_confidences': frame_confidences,
+            'count_in_frame': max_count,
+            'first_seen_frame': first_frame,
+        }
+    
+    def _aggregate_to_entity(self, grid: Grid64, label: str, detections: List[Dict]) -> Optional[GridEntity]:
+        """Mind-of-Thought: 使用 summarize_detections 统一聚合"""
+        summary = self.summarize_detections(detections)
+        if summary is None:
+            return None
+        
+        grid_pos = grid.world_to_grid(summary['position_3d'])
         eid = label.replace(' ', '_')
         
         return GridEntity(
             entity_id=eid,
             category=label,
             grid_position=grid_pos,
-            position_3d=avg_pos,
-            size_3d=size_3d,
-            confidence=float(avg_conf),
-            first_seen_frame=first_frame,
-            count_in_frame=max_count,
+            position_3d=summary['position_3d'],
+            position_cov=summary['position_cov'],
+            position_uncertainty=summary['position_uncertainty'],
+            size_3d=summary['size_3d'],
+            size_uncertainty=1.0,  # 默认尺寸 uncertainty
+            confidence=summary['confidence'],
+            first_seen_frame=summary['first_seen_frame'],
+            count_in_frame=summary['count_in_frame'],
             detections=detections,
-            # Mind-of-Thought: 添加 uncertainty 字段
-            position_cov=position_cov,
-            position_uncertainty=position_uncertainty,
-            depth_std_mean=float(depth_std_mean),
-            obs_count=len(detections),
-            support_frames=support_frames,
-            frame_confidences=frame_confidences,
+            depth_std_mean=summary['depth_std_mean'],
+            obs_count=summary['obs_count'],
+            support_frames=summary['support_frames'],
+            frame_confidences=summary['frame_confidences'],
         )
 
     def search_and_add_entity(self, grid: Grid64, entity_name: str) -> Optional[GridEntity]:
@@ -940,13 +918,23 @@ class Grid64Builder:
                 depth_region = depth_maps[i, y1_int:y2_int+1, x1_int:x2_int+1]
                 if depth_region.size > 0:
                     depth = np.median(depth_region)
+                    # Mind-of-Thought: 计算 depth_std
+                    valid_depths = depth_region[depth_region > 0.01]
+                    if len(valid_depths) > 1:
+                        depth_std = float(np.std(valid_depths))
+                    else:
+                        depth_std = 1.0
                 else:
                     cx_int = int((x1_int + x2_int) / 2)
                     cy_int = int((y1_int + y2_int) / 2)
                     depth = depth_maps[i, cy_int, cx_int]
+                    depth_std = 1.0
                 
                 if depth < 0.01:
                     continue
+                
+                # Mind-of-Thought: 计算 position_uncertainty
+                position_uncertainty = 0.5 * depth_std + 0.5 * (1.0 - conf)
                 
                 # 像素 → 相机坐标
                 center_u = (bbox_scaled[0] + bbox_scaled[2]) / 2
@@ -980,6 +968,8 @@ class Grid64Builder:
                     'width_3d': float(w_3d),
                     'height_3d': float(h_3d),
                     'depth_value': float(depth),
+                    'depth_std': float(depth_std),
+                    'position_uncertainty': float(position_uncertainty),
                 })
         
         if not all_dets:
@@ -1631,17 +1621,21 @@ def process_sample(grid: Grid64, sample: Dict) -> Dict:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Grid64 deterministic baseline')
     parser.add_argument('--n_per_type', type=int, default=10, help='Samples per task type')
     parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--input_results', type=str, default=None, help='Evaluation manifest JSON. Defaults to data/eval_samples_v7_reference.json.')
+    parser.add_argument('--video-dir', action='append', default=None, help='Video directory or VSIBench root. Can be passed multiple times.')
     args = parser.parse_args()
-    
-    # 加载V7基准结果
-    v7_path = PROJECT_ROOT / "outputs" / "evolving_agent_v7_20260203_134612" / "detailed_results.json"
-    logger.info(f"Loading V7 baseline: {v7_path}")
-    with open(v7_path) as f:
+
+    if args.video_dir:
+        set_video_dirs(args.video_dir)
+
+    input_path = resolve_eval_manifest(args.input_results)
+    logger.info(f"Loading evaluation samples: {input_path}")
+    with open(input_path) as f:
         v7_results = json.load(f)
-    logger.info(f"V7 baseline: {len(v7_results)} samples")
+    logger.info(f"Reference manifest: {len(v7_results)} samples")
     
     # 选取测试样本
     test_samples = select_test_samples(v7_results, n_per_type=args.n_per_type)
@@ -1717,9 +1711,10 @@ def main():
     # ========================================================================
     # 汇总结果
     # ========================================================================
+    baseline_vl = np.mean([r["v7_vl_score"] for r in all_results]) if all_results else 0.0
     print("\n" + "=" * 100)
     print("64³ Grid Mind Map 小样本测试结果")
-    print(f"基准: V7 VL Overall = 63.61%")
+    print(f"基准: Reference VL mean = {baseline_vl:.2%}")
     print(f"测试样本: {len(all_results)}")
     print("=" * 100)
     

@@ -6,6 +6,7 @@
 2. CLIP 模式: 从视频帧裁剪实体区域，用 CLIP 分类
 """
 
+import os
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -13,6 +14,19 @@ import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _hf_cache_dir() -> str:
+    return os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+
+
+def _from_pretrained_kwargs(model_ref: str) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {"cache_dir": _hf_cache_dir()}
+    if os.path.exists(model_ref):
+        kwargs["local_files_only"] = True
+    elif os.environ.get("MOT_GDINO_LOCAL_ONLY", "0") == "1":
+        kwargs["local_files_only"] = True
+    return kwargs
 
 # 默认检测提示词 - 常见室内物体
 DEFAULT_DETECTION_PROMPT = (
@@ -87,28 +101,27 @@ class GroundingDINOLabeler:
             from transformers import GroundingDinoProcessor, GroundingDinoForObjectDetection
             
             logger.info(f"Loading GroundingDINO model: {self.model_id}")
-            
-            # 设置缓存目录
-            cache_dir = "/home/tione/notebook/tianjungu/hf_cache"
-            
+
+            load_kwargs = _from_pretrained_kwargs(self.model_id)
+
             self.processor = GroundingDinoProcessor.from_pretrained(
-                self.model_id, 
-                cache_dir=cache_dir
+                self.model_id,
+                **load_kwargs,
             )
             self.model = GroundingDinoForObjectDetection.from_pretrained(
                 self.model_id,
-                cache_dir=cache_dir
+                **load_kwargs,
             )
-            
-            # 移动到设备
-            if self.device == "cuda":
-                import torch
+
+            if isinstance(self.device, str) and self.device.startswith("cuda"):
                 if torch.cuda.is_available():
                     self.model = self.model.to(self.device)
                 else:
                     logger.warning("CUDA not available, using CPU")
                     self.device = "cpu"
-            
+            elif self.device != "cpu":
+                self.model = self.model.to(self.device)
+
             self.model.eval()
             self._loaded = True
             logger.info("GroundingDINO model loaded successfully")
@@ -387,7 +400,7 @@ class SemanticLabeler:
             import torch
             from transformers import CLIPProcessor, CLIPModel
             
-            cache_dir = "/home/tione/notebook/tianjungu/hf_cache"
+            cache_dir = HF_CACHE_DIR
             
             logger.info(f"Loading CLIP model: {self.model_name}")
             self.model = CLIPModel.from_pretrained(self.model_name, cache_dir=cache_dir)

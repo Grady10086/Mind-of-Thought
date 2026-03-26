@@ -38,24 +38,18 @@ from collections import defaultdict, Counter
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
-os.environ['HF_HOME'] = '/home/tione/notebook/tianjungu/hf_cache'
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ['MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK'] = '1'
-os.environ['MIOPEN_LOG_LEVEL'] = '1'
-
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from runtime_config import ensure_runtime_env, resolve_eval_manifest, resolve_vl_model_path
+
+ensure_runtime_env()
+
 np.random.seed(42); torch.manual_seed(42)
 if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-VIDEO_DIRS = [
-    '/home/tione/notebook/tianjungu/projects/ms-swift/tianjungu/projects/ms-swift/run_sft_deepspeed.sh/vsibench/arkitscenes',
-    '/home/tione/notebook/tianjungu/projects/ms-swift/tianjungu/projects/ms-swift/run_sft_deepspeed.sh/vsibench/scannet',
-    '/home/tione/notebook/tianjungu/projects/ms-swift/tianjungu/projects/ms-swift/run_sft_deepspeed.sh/vsibench/scannetpp',
-]
 
 from scripts.grid64_real_test import (
     Grid64, GridEntity, Grid64Builder,
@@ -63,15 +57,20 @@ from scripts.grid64_real_test import (
     _match_name, find_video_path, evaluate_sample, mean_relative_accuracy,
     grid_answer_counting, grid_answer_size, grid_answer_room_size,
     grid_answer_abs_distance, grid_answer_direction, grid_answer_rel_distance,
-    grid_answer_appearance_order, grid_answer_route,
+    grid_answer_appearance_order, grid_answer_route, set_video_dirs,
 )
 
 # Import Unified System
 USE_UNIFIED = os.environ.get('USE_UNIFIED', 'false').lower() == 'true'
+unified_grid_answer = None
+detect_task_type = None
 if USE_UNIFIED:
-    from scripts.grid64_unified_pipeline import unified_grid_answer, detect_task_type
-    logger.info("[V21] Unified System enabled via USE_UNIFIED=true")
-
+    try:
+        from scripts.grid64_unified_pipeline import unified_grid_answer, detect_task_type
+        logger.info('[V21] Unified System enabled via USE_UNIFIED=true')
+    except ImportError as exc:
+        USE_UNIFIED = False
+        logger.warning('[V21] USE_UNIFIED requested but unavailable: %s', exc)
 
 # ============================================================================
 # Grid256 + fps-based builder (same as V17/V18)
@@ -265,17 +264,9 @@ class VLModel:
                 self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
             elif 'qwen3' in lp or 'Qwen3' in model_path:
-                try:
-                    # Try Qwen3VL first (newer transformers)
-                    from transformers import Qwen3VLForConditionalGeneration
-                    self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                        model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
-                except ImportError:
-                    # Fall back to AutoModelForImageTextToText (older transformers)
-                    logger.warning("Qwen3VLForConditionalGeneration not available, using AutoModelForImageTextToText")
-                    from transformers import AutoModelForImageTextToText
-                    self.model = AutoModelForImageTextToText.from_pretrained(
-                        model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
+                from transformers import Qwen3VLForConditionalGeneration
+                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_path, torch_dtype=torch.bfloat16, device_map=self.device, trust_remote_code=True)
             else:
                 from transformers import Qwen2_5_VLForConditionalGeneration
                 self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -393,7 +384,9 @@ class VLModel:
                                                skip_special_tokens=True)[0].strip()
             return resp, conf_letter, conf_val
         except Exception as e:
-            logger.warning(f"VL call_with_confidence failed: {e}"); return "", '', 0.0
+            logger.warning(f"VL call_with_confidence failed: {e}")
+            logger.warning(traceback.format_exc())
+            return "", '', 0.0
 
     def call_frames_with_confidence(self, prompt, frames_pil, abcd_ids=None, max_tokens=128,
                                      max_pixels=VL_DEFAULT_MAX_PIXELS, images=None):
@@ -438,12 +431,11 @@ class ToolExecutionContext:
         self.builder = builder; self.question = question; self.options = options
         self.question_type = question_type
         self.tool_trace = []; self.vl_calls = 0; self._final_answer = None
-        
-        # === Mind-of-Thought: Belief Probing + Uncertainty Tracking ===
-        self.belief_probe_history = []      # List of belief snapshots
-        self.focused_frame_history = []     # Track which frames were selected
-        self.uncertainty_history = []       # Track uncertainty evolution
-        self.query_entities = []            # Entities mentioned in question
+        # Mind-of-Thought: Belief Probing + Uncertainty History
+        self.belief_probe_history = []
+        self.focused_frame_history = []
+        self.uncertainty_history = []
+        self.query_entities = []
 
 
 def _extract_question_entities(question, options):
@@ -472,22 +464,187 @@ def _extract_question_entities(question, options):
 
 
 # ============================================================================
+# Mind-of-Thought: Belief Probing + Uncertainty Helpers
+# ============================================================================
+
+def _entity_uncertainty(ent):
+    """获取实体的 uncertainty 标量"""
+    if getattr(ent, 'position_uncertainty', None) is not None:
+        return float(ent.position_uncertainty)
+    if getattr(ent, 'position_cov', None) is not None:
+        return float(np.sqrt(np.trace(ent.position_cov)))
+    if getattr(ent, 'detections', None):
+        pos = np.array([d['position_3d'] for d in ent.detections if 'position_3d' in d])
+        if len(pos) >= 2:
+            return float(np.mean(np.std(pos, axis=0)))
+    return 1.0
+
+
+def _mean_query_uncertainty(ctx, rel_names):
+    """计算 query entities 的平均 uncertainty"""
+    uncertainties = []
+    for name in rel_names:
+        found = ctx.grid.get_by_category(name)
+        if found:
+            ent = found[0]
+            uncertainties.append(_entity_uncertainty(ent))
+    return float(np.mean(uncertainties)) if uncertainties else 1.0
+
+
+def _query_entity_map(ctx, rel_names):
+    """建立 query entity name 到 entity 的映射"""
+    result = {}
+    for name in rel_names:
+        found = ctx.grid.get_by_category(name)
+        if found:
+            result[name] = found[0]
+    return result
+
+
+def _probe_belief(ctx, stage, rel_names):
+    """Mind-of-Thought: Belief Probing - 记录当前 belief snapshot
+    
+    Args:
+        ctx: ToolExecutionContext
+        stage: 当前阶段标记 (如 'P0', 'R1_before_select', 'R1_after_evolve', 'final')
+        rel_names: query 相关的 entity names
+    """
+    entity_map = _query_entity_map(ctx, rel_names)
+    
+    # 收集 entities 信息
+    entities_info = []
+    uncertainties = []
+    
+    for name, ent in entity_map.items():
+        unc = _entity_uncertainty(ent)
+        uncertainties.append(unc)
+        
+        entity_info = {
+            'name': name,
+            'exists': True,
+            'position_3d': ent.position_3d.tolist() if ent.position_3d is not None else None,
+            'position_uncertainty': unc,
+            'position_cov_diag': np.diag(ent.position_cov).tolist() if getattr(ent, 'position_cov', None) is not None else None,
+            'confidence': float(getattr(ent, 'confidence', 0.5)),
+            'obs_count': int(getattr(ent, 'obs_count', len(getattr(ent, 'detections', [])))),
+            'support_frames': list(getattr(ent, 'support_frames', [])),
+        }
+        entities_info.append(entity_info)
+    
+    # 计算平均 query uncertainty
+    mean_query_uncertainty = float(np.mean(uncertainties)) if uncertainties else 1.0
+    
+    # 关系信息（最小版本：距离关系）
+    relations_info = []
+    if len(entity_map) >= 2:
+        entities_list = list(entity_map.items())
+        for i in range(len(entities_list)):
+            for j in range(i + 1, len(entities_list)):
+                name_i, ent_i = entities_list[i]
+                name_j, ent_j = entities_list[j]
+                
+                # 计算物理距离
+                pos_i = ent_i.position_3d
+                pos_j = ent_j.position_3d
+                if pos_i is not None and pos_j is not None:
+                    dist = np.linalg.norm(pos_i - pos_j)
+                    unc_i = _entity_uncertainty(ent_i)
+                    unc_j = _entity_uncertainty(ent_j)
+                    
+                    relations_info.append({
+                        'pair': [name_i, name_j],
+                        'distance_mean': float(dist),
+                        'distance_std': float(unc_i + unc_j),
+                    })
+    
+    # 构建 probe
+    probe = {
+        'stage': stage,
+        'query_entities': rel_names,
+        'entities': entities_info,
+        'relations': relations_info,
+        'mean_query_uncertainty': mean_query_uncertainty,
+        'timestamp': time.time(),
+    }
+    
+    # 记录到 context
+    ctx.belief_probe_history.append(probe)
+    ctx.uncertainty_history.append({
+        'stage': stage,
+        'mean_query_uncertainty': mean_query_uncertainty,
+    })
+    
+    return probe
+
+
+def _detection_noise_score(ent, det):
+    """Mind-of-Thought: 计算 detection 的 noise score
+    
+    用于 evolution 时选择要删除的观测
+    分数越高表示该 detection 越可能是噪声
+    """
+    mu = ent.position_3d
+    cov = ent.position_cov if getattr(ent, 'position_cov', None) is not None else np.eye(3) * 0.1
+    inv_cov = np.linalg.pinv(cov + np.eye(3) * 1e-6)
+    
+    diff = det['position_3d'] - mu
+    maha = float(np.sqrt(diff.T @ inv_cov @ diff))
+    
+    det_u = float(det.get('position_uncertainty', 1.0))
+    conf_penalty = 1.0 - float(det.get('confidence', 0.5))
+    
+    score = det_u + 0.5 * maha + 0.3 * conf_penalty
+    return score
+
+
+def _refresh_entity_from_detections(ctx, ent, detections):
+    """Mind-of-Thought: 使用 summarize_detections 重建 entity 统计"""
+    if not detections or not hasattr(ctx.builder, 'summarize_detections'):
+        return False
+    
+    summary = ctx.builder.summarize_detections(detections)
+    if summary is None:
+        return False
+    
+    # 更新 entity 字段
+    ent.position_3d = summary['position_3d']
+    ent.position_cov = summary['position_cov']
+    ent.position_uncertainty = summary['position_uncertainty']
+    ent.confidence = summary['confidence']
+    ent.size_3d = summary['size_3d']
+    ent.depth_std_mean = summary['depth_std_mean']
+    ent.obs_count = summary['obs_count']
+    ent.support_frames = summary['support_frames']
+    ent.frame_confidences = summary['frame_confidences']
+    ent.count_in_frame = summary['count_in_frame']
+    ent.first_seen_frame = summary['first_seen_frame']
+    ent.detections = detections
+    
+    # 更新 grid position
+    ent.grid_position = ctx.grid.world_to_grid(ent.position_3d)
+    
+    return True
+
+
+# ============================================================================
 # Tools: CODER, EVOLUTOR (same as V17/V18)
 # ============================================================================
 
 def coder_tool(ctx, computation, **kwargs):
     grid = ctx.grid; c = computation.strip().lower()
     try:
-        # Try Unified System first if enabled
-        if USE_UNIFIED and c in ['direction', 'rel_distance', 'appearance_order', 'route']:
+        # === UNIFIED SYSTEM INTEGRATION (Choice Tasks Only) ===
+        # Only use Unified System for choice tasks, keep numeric tasks with original V21 logic
+        if USE_UNIFIED and unified_grid_answer is not None and c in ['direction', 'rel_distance', 'appearance_order', 'route']:
             try:
                 p, r = unified_grid_answer(grid, ctx.question, ctx.options, ctx.vl, ctx.video_path)
                 ctx.tool_trace.append({'tool':'coder','comp':c,'result':p,'unified':True})
                 return f"{c.capitalize()} (Unified): answer={p}, detail={r}"
             except Exception as ue:
                 logger.warning(f"Unified system failed for {c}: {ue}, falling back to original")
+                # Fall through to original implementation
         
-        # Original implementations
+        # === ORIGINAL V21 IMPLEMENTATION ===
         if c == 'direction':
             p, r = grid_answer_direction(grid, ctx.question, ctx.options)
             ctx.tool_trace.append({'tool':'coder','comp':c,'result':p}); return f"Direction: answer={p}, detail={r}"
@@ -522,7 +679,7 @@ def coder_tool(ctx, computation, **kwargs):
             p, r = grid_answer_route(grid, ctx.question, ctx.options)
             ctx.tool_trace.append({'tool':'coder','comp':c,'result':p}); return f"Route: answer={p}, detail={r}"
         else: return f"Unknown '{c}'"
-    except Exception as e: return f"Coder error ({c}): {e}"  
+    except Exception as e: return f"Coder error ({c}): {e}"
 
 
 def evolutor_tool(ctx, action, target):
@@ -553,21 +710,49 @@ def evolutor_tool(ctx, action, target):
                     try: bad.add(int(seg))
                     except: pass
             ents = grid.get_by_category(ename)
-            if not ents: return f"FILTER_FRAMES: '{ename}' not found."
-            ent = ents[0]; orig = len(ent.detections)
+            if not ents:
+                return f"FILTER_FRAMES: '{ename}' not found."
+            ent = ents[0]
+            orig = len(ent.detections)
             filt = [d for d in ent.detections if d.get('frame_order') not in bad]
             if len(filt) < orig:
                 if filt:
-                    pos = np.array([d['position_3d'] for d in filt])
-                    ent.position_3d = np.median(pos, axis=0)
-                    ent.grid_position = grid.world_to_grid(ent.position_3d)
-                    ent.confidence = np.mean([d['confidence'] for d in filt])
-                    ent.detections = filt
-                    ctx.tool_trace.append({'tool':'evolutor','action':'FILTER_FRAMES','target':target,'ok':True,'frames_removed':orig-len(filt)})
-                    return f"FILTER_FRAMES '{ename}': removed {orig-len(filt)} dets"
+                    # Mind-of-Thought: 使用 summarize_detections 重建 entity
+                    if hasattr(ctx.builder, 'summarize_detections'):
+                        summary = ctx.builder.summarize_detections(filt)
+                        if summary is not None:
+                            ent.position_3d = summary['position_3d']
+                            ent.position_cov = summary['position_cov']
+                            ent.position_uncertainty = summary['position_uncertainty']
+                            ent.confidence = summary['confidence']
+                            ent.size_3d = summary['size_3d']
+                            ent.depth_std_mean = summary['depth_std_mean']
+                            ent.obs_count = summary['obs_count']
+                            ent.support_frames = summary['support_frames']
+                            ent.frame_confidences = summary['frame_confidences']
+                            ent.count_in_frame = summary['count_in_frame']
+                            ent.first_seen_frame = summary['first_seen_frame']
+                            ent.detections = filt
+                            ent.grid_position = grid.world_to_grid(ent.position_3d)
+                        else:
+                            # fallback: 手动设置
+                            pos = np.array([d['position_3d'] for d in filt])
+                            ent.position_3d = np.median(pos, axis=0)
+                            ent.grid_position = grid.world_to_grid(ent.position_3d)
+                            ent.confidence = np.mean([d['confidence'] for d in filt])
+                            ent.detections = filt
+                    else:
+                        # fallback: 手动设置
+                        pos = np.array([d['position_3d'] for d in filt])
+                        ent.position_3d = np.median(pos, axis=0)
+                        ent.grid_position = grid.world_to_grid(ent.position_3d)
+                        ent.confidence = np.mean([d['confidence'] for d in filt])
+                        ent.detections = filt
+                    ctx.tool_trace.append({'tool': 'evolutor', 'action': 'FILTER_FRAMES', 'target': target, 'ok': True, 'frames_removed': orig - len(filt)})
+                    return f"FILTER_FRAMES '{ename}': removed {orig - len(filt)} dets, uncertainty={getattr(ent, 'position_uncertainty', 'N/A')}"
                 else:
                     del grid.entities[ent.entity_id]
-                    ctx.tool_trace.append({'tool':'evolutor','action':'FILTER_FRAMES','target':target,'ok':True,'result':'deleted'})
+                    ctx.tool_trace.append({'tool': 'evolutor', 'action': 'FILTER_FRAMES', 'target': target, 'ok': True, 'result': 'deleted'})
                     return f"FILTER_FRAMES '{ename}': all filtered, removed."
             return f"FILTER_FRAMES '{ename}': no change."
         except Exception as e: return f"FILTER_FRAMES error: {e}"
@@ -1006,166 +1191,25 @@ def _compute_choice_confidence(model, processor, inputs):
     """Forward pass to get P(A), P(B), P(C), P(D) for first generated token.
     Returns (top_letter, top_conf) — 2 values."""
     abcd_ids = _get_abcd_token_ids(processor)
-    with torch.no_grad():
-        outputs = model(**inputs)
-        last_logits = outputs.logits[0, -1, :]
-        abcd_logits = []
-        valid_letters = []
-        for letter in 'ABCD':
-            tid = abcd_ids.get(letter)
-            if tid is not None:
-                abcd_logits.append(last_logits[tid].item())
-                valid_letters.append(letter)
-        if not abcd_logits:
-            return '', 0.0
-        probs = F.softmax(torch.tensor(abcd_logits), dim=0).numpy()
-        top_idx = int(np.argmax(probs))
-        return valid_letters[top_idx], float(probs[top_idx])
-
-
-# ============================================================================
-# Mind-of-Thought: Belief Probing + Uncertainty-Guided Evolution
-# ============================================================================
-
-def _entity_uncertainty(ent):
-    """提取 entity 的标量 uncertainty"""
-    if hasattr(ent, 'position_uncertainty') and ent.position_uncertainty is not None:
-        return ent.position_uncertainty
-    return 1.0  # 默认高 uncertainty
-
-def _mean_query_uncertainty(ctx, rel_names):
-    """计算问题相关 entities 的平均 uncertainty"""
-    uncertainties = []
-    for name in rel_names:
-        found = ctx.grid.get_by_category(name)
-        if found:
-            uncertainties.append(_entity_uncertainty(found[0]))
-    if not uncertainties:
-        return 1.0
-    return float(np.mean(uncertainties))
-
-def _probe_belief(ctx, stage, rel_names):
-    """
-    Mind-of-Thought: Belief Probing
-    记录当前belief状态到 probe_history
-    """
-    snapshot = {
-        'stage': stage,
-        'entities': {},
-        'relations': {},
-        'uncertainty': {},
-    }
-    
-    # 记录相关 entities
-    for name in rel_names:
-        found = ctx.grid.get_by_category(name)
-        if found:
-            e = found[0]
-            snapshot['entities'][name] = {
-                'position': e.position_3d.tolist() if e.position_3d is not None else None,
-                'confidence': e.confidence,
-                'uncertainty': _entity_uncertainty(e),
-                'obs_count': getattr(e, 'obs_count', len(e.detections)),
-                'support_frames': getattr(e, 'support_frames', []),
-            }
-    
-    # 计算平均 uncertainty
-    snapshot['mean_uncertainty'] = _mean_query_uncertainty(ctx, rel_names)
-    
-    ctx.belief_probe_history.append(snapshot)
-    return snapshot
-
-def _detection_noise_score(entity, detection):
-    """
-    计算单个 detection 的 noise score (越高越 noisy)
-    score = uncertainty + 0.5 * mahalanobis_distance + 0.3 * (1 - confidence)
-    """
-    unc = detection.get('position_uncertainty', 1.0)
-    conf = detection.get('confidence', 0.5)
-    
-    # Mahalanobis distance (简化为相对于 entity 位置的 z-score)
-    det_pos = detection.get('position_3d')
-    ent_pos = entity.position_3d if entity.position_3d is not None else det_pos
-    
-    if det_pos is not None and ent_pos is not None:
-        diff = np.array(det_pos) - np.array(ent_pos)
-        # 简化的 mahalanobis: 使用 entity 的协方差或单位矩阵
-        if hasattr(entity, 'position_cov') and entity.position_cov is not None:
-            try:
-                cov_inv = np.linalg.inv(entity.position_cov + np.eye(3) * 1e-4)
-                mahal = float(np.sqrt(diff.T @ cov_inv @ diff))
-            except:
-                mahal = float(np.linalg.norm(diff))
-        else:
-            mahal = float(np.linalg.norm(diff))
-    else:
-        mahal = 0.0
-    
-    score = unc + 0.5 * mahal + 0.3 * (1.0 - conf)
-    return score
-
-def _refresh_entity_from_detections(ctx, entity, detections):
-    """用 summarize_detections 重新计算 entity 属性"""
-    summary = entity.summarize_detections(detections)
-    if summary is not None:
-        entity.position_3d = summary['position_3d']
-        entity.position_cov = summary['position_cov']
-        entity.position_uncertainty = summary['position_uncertainty']
-        entity.confidence = summary['confidence']
-        # 修复: 更新 size_3d
-        if 'size_3d' in summary:
-            entity.size_3d = summary['size_3d']
-        entity.detections = detections
-        entity.obs_count = len(detections)
-        entity.support_frames = sorted(set(d['frame_idx'] for d in detections))
-        entity.grid_position = ctx.grid.world_to_grid(entity.position_3d)
-        return True
-    return False
-
-def _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal):
-    """
-    Mind-of-Thought: Uncertainty-Guided Frame Selection
-    score = relevance × uncertainty × novelty
-    """
-    scored = []
-    
-    # 获取 entity frames mapping
-    entity_frames = {}
-    entity_uncertainties = {}
-    for name in rel_names:
-        found = ctx.grid.get_by_category(name)
-        if found:
-            e = found[0]
-            entity_uncertainties[name] = _entity_uncertainty(e)
-            # 获取该 entity 出现的 frames
-            if hasattr(e, 'support_frames'):
-                entity_frames[name] = set(e.support_frames)
-            else:
-                entity_frames[name] = set(d.get('frame_idx', 0) for d in e.detections)
-    
-    for frame in frames:
-        # Relevance: 该 frame 中有多少 query entities 可见
-        visible_entities = [name for name, ent_frames in entity_frames.items() 
-                           if frame in ent_frames]
-        relevance_score = len(visible_entities)
-        
-        # Uncertainty: 可见 entities 的平均 uncertainty
-        if visible_entities:
-            uncertainty_score = np.mean([entity_uncertainties.get(name, 1.0) 
-                                        for name in visible_entities])
-        else:
-            uncertainty_score = 0.5
-        
-        # Novelty: 不在 prev_frames 中得高分
-        novelty_score = 1.0 if frame not in prev_frames else 0.3
-        
-        # 综合 score
-        score = relevance_score * uncertainty_score * novelty_score
-        scored.append((frame, score))
-    
-    # 按 score 降序排序
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [f for f, s in scored]
+    try:
+        with torch.no_grad():
+            outputs = model(**inputs)
+            last_logits = outputs.logits[0, -1, :]
+            abcd_logits = []
+            valid_letters = []
+            for letter in 'ABCD':
+                tid = abcd_ids.get(letter)
+                if tid is not None:
+                    abcd_logits.append(last_logits[tid].item())
+                    valid_letters.append(letter)
+            if not abcd_logits:
+                return '', 0.0
+            probs = F.softmax(torch.tensor(abcd_logits), dim=0).numpy()
+            top_idx = int(np.argmax(probs))
+            return valid_letters[top_idx], float(probs[top_idx])
+    except Exception as e:
+        logger.warning(f"_compute_choice_confidence failed: {e}, using default confidence")
+        return '', 0.5  # Default confidence when forward pass fails
 
 
 # ============================================================================
@@ -1173,51 +1217,135 @@ def _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal):
 # ============================================================================
 
 def _evolve_belief(ctx, rel_names, std_threshold, rp):
-    """
-    Mind-of-Thought: Detection Noise Score Evolution
-    使用 uncertainty + mahalanobis + confidence 综合 score
-    保守策略：只删除 top-m noisy detections, m = max(1, min(2, n//4))
+    """Mind-of-Thought: Evolve Grid belief using detection noise score
+    
+    1. 只关注 query-relevant entities
+    2. 如果 entity_uncertainty <= threshold, 跳过
+    3. 对 detections 按 noise_score 排序
+    4. 只删除 top-m 个最差观测 (m = max(1, min(2, len(detections) // 4)))
+    5. 删除后使用 summarize_detections 重建 entity
+    
     Returns True if any entity was modified.
     """
     modified = False
     for name in rel_names:
         found = ctx.grid.get_by_category(name)
-        if not found: continue
+        if not found:
+            continue
         e = found[0]
-        if not e.detections or len(e.detections) < 4: continue
+        if not e.detections or len(e.detections) < 4:
+            continue
         
-        # 计算所有 detections 的 noise score
-        scored_dets = [(det, _detection_noise_score(e, det)) for det in e.detections]
+        # 检查 entity uncertainty
+        ent_uncertainty = _entity_uncertainty(e)
+        if ent_uncertainty <= std_threshold:
+            continue  # 足够确定，不需要 evolve
         
-        # 按 noise score 降序排列（高 score = 高 noise）
+        # 计算每个 detection 的 noise score
+        scored_dets = []
+        for det in e.detections:
+            noise_score = _detection_noise_score(e, det)
+            scored_dets.append((det, noise_score))
+        
+        # 按 noise score 排序（高的优先删除）
         scored_dets.sort(key=lambda x: x[1], reverse=True)
         
-        # 保守删除策略：最多删 2 个，最少 1 个
-        n = len(scored_dets)
-        m = max(1, min(2, n // 4))  # 保守: 25% 但最多 2 个
+        # 计算要删除的数量 (更保守的策略)
+        n_dets = len(scored_dets)
+        m = max(1, min(2, n_dets // 4))  # 最多删 2 个，或 1/4
         
+        # 选择要删除的 detections
         to_remove = scored_dets[:m]
-        if to_remove:
-            # 从 detections 中移除
-            remove_set = set(id(det) for det, _ in to_remove)
-            new_detections = [det for det in e.detections if id(det) not in remove_set]
+        removed_frames = []
+        
+        for det, score in to_remove:
+            frame_idx = det.get('frame_idx', -1)
+            if frame_idx >= 0:
+                removed_frames.append(frame_idx)
+                # 从 detections 列表中移除
+                e.detections.remove(det)
+        
+        if removed_frames:
+            # 使用 summarize_detections 重建 entity
+            success = _refresh_entity_from_detections(ctx, e, e.detections)
             
-            if len(new_detections) < len(e.detections):
-                # 刷新 entity
-                _refresh_entity_from_detections(ctx, e, new_detections)
+            if success:
                 modified = True
-                rp.append(f"[evolve] {name}: removed {len(to_remove)} noisy dets, unc={e.position_uncertainty:.3f}")
-                logger.info(f"    evolve: {name} removed {len(to_remove)} noisy detections")
+                rp.append(f"[filter] {name}: removed {len(removed_frames)} noisy detections from frames {removed_frames}")
+                logger.info(f"    evolve: {name} removed {len(removed_frames)} detections, new uncertainty={e.position_uncertainty:.3f}")
+            else:
+                rp.append(f"[filter] {name}: failed to refresh after removal")
+                logger.warning(f"    evolve: {name} refresh failed")
+    
     return modified
 
 
-def _select_frames(ctx, is_temporal, prev_frames=None):
+def _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal):
+    """Mind-of-Thought: 基于 query relevance + uncertainty + novelty 的 frame scoring
+    
+    score(frame) = relevance_score * uncertainty_score * novelty_score
     """
-    Select focused frames from current Grid state.
-    Mind-of-Thought: 使用 uncertainty-guided scoring
+    if not frames:
+        return []
+    
+    # 建立 entity 到 frames 的映射
+    entity_frames = {}
+    entity_uncertainties = {}
+    for name in rel_names:
+        found = ctx.grid.get_by_category(name)
+        if found:
+            ent = found[0]
+            ent_frames = set()
+            for d in ent.detections:
+                fi = d.get('frame_idx', -1)
+                if fi >= 0:
+                    ent_frames.add(fi)
+            entity_frames[name] = ent_frames
+            entity_uncertainties[name] = _entity_uncertainty(ent)
+    
+    # 计算每个 frame 的分数
+    scored_frames = []
+    for frame in frames:
+        # Relevance: 当前 frame 中可见的 query entity 数量
+        visible_entities = [name for name, ent_frames in entity_frames.items() if frame in ent_frames]
+        relevance_score = len(visible_entities)
+        
+        # Uncertainty: 当前 frame 覆盖的 query entity 的 uncertainty 之和
+        uncertainty_score = 0.0
+        for name in visible_entities:
+            uncertainty_score += entity_uncertainties.get(name, 1.0)
+        uncertainty_score = max(0.1, uncertainty_score)  # 避免为0
+        
+        # Novelty: 是否已在之前的 frames 中
+        novelty_score = 1.0 if frame not in prev_frames else 0.3
+        
+        # 综合分数
+        score = relevance_score * uncertainty_score * novelty_score
+        
+        scored_frames.append({
+            'frame': frame,
+            'score': score,
+            'relevance': relevance_score,
+            'uncertainty': uncertainty_score,
+            'novelty': novelty_score,
+            'visible_entities': visible_entities,
+        })
+    
+    # 按分数排序
+    scored_frames.sort(key=lambda x: x['score'], reverse=True)
+    return scored_frames
+
+
+def _select_frames(ctx, is_temporal, rel_names=None, prev_frames=None, round_id=0):
+    """Mind-of-Thought: Select focused frames with uncertainty-aware scoring
+    
+    两阶段选择:
+    1. 召回 candidate frames
+    2. 基于 relevance + uncertainty + novelty 排序并选择 top-k
     """
     prev_frames = prev_frames or set()
     
+    # 阶段1: 召回 candidate frames
     if is_temporal:
         frames, ents = _get_entity_union_frames(ctx.grid, ctx.question, ctx.options)
         ftype = 'temporal'
@@ -1225,13 +1353,27 @@ def _select_frames(ctx, is_temporal, prev_frames=None):
         frames, ents = _get_cooccurrence_frames(ctx.grid, ctx.question, ctx.options)
         ftype = 'cooccur'
     
-    # Mind-of-Thought: 如果有 frames，使用 uncertainty-guided scoring
-    if frames and len(frames) > 1:
+    # 获取 query entity names
+    if rel_names is None:
         rel_names = _extract_question_entities(ctx.question, ctx.options)
-        sorted_frames = _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal)
-        return sorted_frames, ents, ftype
     
-    return frames, ents, ftype
+    # 阶段2: 基于 uncertainty 的 frame scoring
+    scored_frames = _score_candidate_frames(ctx, frames, rel_names, prev_frames, is_temporal)
+    
+    # 选择 top-k
+    max_ff = 12 if is_temporal else 8
+    selected_frames = [sf['frame'] for sf in scored_frames[:max_ff]]
+    
+    # 记录到 context
+    ctx.focused_frame_history.append({
+        'stage': f'R{round_id}_select',
+        'candidate_frames': frames,
+        'selected_frames': selected_frames,
+        'scores': [{k: v for k, v in sf.items() if k != 'visible_entities'} for sf in scored_frames[:max_ff]],
+        'ftype': ftype,
+    })
+    
+    return selected_frames, ents, ftype
 
 
 def _vl_on_frames(ctx, frames, ents, ftype, is_temporal, rp, round_id):
@@ -1306,13 +1448,18 @@ def _vl_on_frames_conf(ctx, frames, ents, ftype, is_temporal, rp, round_id, abcd
 
 
 def v21_loop(ctx, max_rounds=3, abcd_ids=None):
-    """
-    V21 + Mind-of-Thought: Belief Probing + Uncertainty-Guided Evolution
+    """Mind-of-Thought: V21 + Belief Probing + Uncertainty-Guided Evolution
 
-    Key additions:
-    - Belief probing at P0, pre/post evolution, and final
-    - Uncertainty-guided frame selection
-    - Detection noise score evolution (conservative filtering)
+    V21 baseline:
+    - P1 global VL call also gets logit confidence
+    - Each focused VL call also gets logit confidence
+    - When global==focused (consensus), check avg_conf
+    - Final vote uses confidence weighting
+
+    Mind-of-Thought additions:
+    - Belief probing at P0, each round before/after evolution, and final
+    - Uncertainty-aware frame selection (relevance + uncertainty + novelty)
+    - Detection noise score based evolution (not just confidence threshold)
     - Uncertainty-aware stopping condition
     """
     rp = []
@@ -1324,13 +1471,10 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 
     is_temporal = _is_temporal_question(ctx.question)
     rel_names = _extract_question_entities(ctx.question, ctx.options)
-    ctx.query_entities = rel_names  # 记录 query entities
+    ctx.query_entities = rel_names  # 缓存 query entities
 
     # ──── Phase 0: Build Belief (hidden from VL) ────
     rp.append("[P0:belief]")
-
-    # Mind-of-Thought: P0 Belief Probing
-    _probe_belief(ctx, 'P0_init', rel_names)
 
     cr = coder_tool(ctx, ct) if ct else ''
     if cr and 'not found' in cr.lower():
@@ -1342,6 +1486,9 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
     coder_ans = m_coder_ans.group(1) if m_coder_ans else ''
     rp.append(f"[coder] {coder_ans}")
     logger.info(f"  P0: coder_type={ct}, coder_ans={coder_ans} (hidden from VL)")
+
+    # Mind-of-Thought: P0 belief probing
+    _probe_belief(ctx, 'P0', rel_names)
 
     # ──── P1: Global Perception WITH CONFIDENCE ────
     rp.append("[P1:vl_global]")
@@ -1355,7 +1502,7 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 
     # ──── Iterative Evolution Loop ────
     std_thresholds = [0.4, 0.3, 0.2, 0.15, 0.1]
-    stop_threshold = 0.35  # Mind-of-Thought: uncertainty 停止阈值
+    stop_threshold = 0.35  # Mind-of-Thought: uncertainty stopping threshold
 
     vl_history = [('global', vl_global, conf_g)]  # (source, answer, confidence)
     prev_frames = set()
@@ -1367,40 +1514,24 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
         rp.append(f"[R{round_id}]")
         logger.info(f"  Round {round_id}/{max_rounds}")
 
-        # 1. Select frames from current Grid state (with uncertainty guidance)
-        frames, ents, ftype = _select_frames(ctx, is_temporal, prev_frames)
+        # Mind-of-Thought: probing before frame selection
+        _probe_belief(ctx, f'R{round_id}_before_select', rel_names)
+
+        # 1. Select frames from current Grid state (with uncertainty-aware scoring)
+        frames, ents, ftype = _select_frames(ctx, is_temporal, rel_names, prev_frames, round_id)
         cur_frames = set(frames) if frames else set()
-        ctx.focused_frame_history.append(list(cur_frames))
 
-        # Mind-of-Thought: Pre-selection uncertainty
-        pre_unc = _mean_query_uncertainty(ctx, rel_names)
-
-        # 2. New info check (Mind-of-Thought: 添加 uncertainty-aware 停止)
+        # 2. New info check
         if round_id > 1 and cur_frames == prev_frames:
-            # 检查 uncertainty 是否足够低
-            if pre_unc < stop_threshold:
-                converge_type = 'uncertainty_threshold'
-                rp.append(f"[R{round_id}:uncertainty_stop] unc={pre_unc:.3f} < {stop_threshold}")
-                logger.info(f"    R{round_id}: frames unchanged & uncertainty low → stop")
-                break
-            else:
-                rp.append(f"[R{round_id}:no_new_frames_high_unc] unc={pre_unc:.3f}")
-                logger.info(f"    R{round_id}: frames unchanged but unc={pre_unc:.3f} → continue")
+            rp.append(f"[R{round_id}:no_new_frames]")
+            logger.info(f"    R{round_id}: frames unchanged → stop")
+            break
 
         # 3. VL judges on focused frames WITH CONFIDENCE
         vl_ans, vl_conf, _ = _vl_on_frames_conf(
             ctx, frames, ents, ftype, is_temporal, rp, round_id, abcd_ids)
         vl_history.append((f'R{round_id}', vl_ans, vl_conf))
         n_rounds = round_id
-
-        # Mind-of-Thought: Post-VL uncertainty
-        post_unc = _mean_query_uncertainty(ctx, rel_names)
-        ctx.uncertainty_history.append({
-            'round': round_id,
-            'pre_uncertainty': pre_unc,
-            'post_uncertainty': post_unc,
-            'mean_query_uncertainty': post_unc,
-        })
 
         # 4. CONFIDENCE-AWARE convergence check
         # (a) Global consensus: focused agrees with anchor
@@ -1417,13 +1548,7 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
                 rp.append(f"[R{round_id}:weak_consensus_skip] {vl_ans} avg_conf={avg_conf:.2f} < {CONFIDENCE_THRESHOLD}")
                 logger.info(f"    R{round_id}: WEAK CONSENSUS {vl_ans} (avg_conf={avg_conf:.2f}) → continue evolving")
                 threshold = std_thresholds[min(round_id - 1, len(std_thresholds) - 1)]
-                
-                # Mind-of-Thought: Pre-evolution probe
-                _probe_belief(ctx, f'R{round_id}_pre_evolve', rel_names)
                 _evolve_belief(ctx, rel_names, threshold, rp)
-                # Mind-of-Thought: Post-evolution probe
-                _probe_belief(ctx, f'R{round_id}_post_evolve', rel_names)
-                
                 prev_frames = cur_frames
                 prev_focused_answer = vl_ans
                 continue
@@ -1440,22 +1565,28 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
         rp.append(f"[R{round_id}:evolve] std_th={threshold:.1f}")
         logger.info(f"    R{round_id}: evolving belief (std_threshold={threshold})")
 
-        # Mind-of-Thought: Pre-evolution probe
-        _probe_belief(ctx, f'R{round_id}_pre_evolve', rel_names)
-        
         belief_changed = _evolve_belief(ctx, rel_names, threshold, rp)
-        
-        # Mind-of-Thought: Post-evolution probe
-        _probe_belief(ctx, f'R{round_id}_post_evolve', rel_names)
 
         if not belief_changed:
             rp.append(f"[R{round_id}:belief_stable]")
             logger.info(f"    R{round_id}: belief stable, no entities filtered")
 
+        # Mind-of-Thought: probing after evolution
+        _probe_belief(ctx, f'R{round_id}_after_evolve', rel_names)
+
+        # Mind-of-Thought: uncertainty-aware stopping condition
+        mean_unc = _mean_query_uncertainty(ctx, rel_names)
+        if cur_frames == prev_frames and mean_unc < stop_threshold:
+            rp.append(f"[R{round_id}:uncertainty_stop] mean_unc={mean_unc:.3f} < {stop_threshold}")
+            logger.info(f"    R{round_id}: UNCERTAINTY STOP (frames unchanged + low uncertainty)")
+            converge_type = 'uncertainty_threshold'
+            n_rounds = round_id
+            break
+
         prev_frames = cur_frames
         prev_focused_answer = vl_ans
 
-    # Mind-of-Thought: Final belief probe
+    # Mind-of-Thought: final probing
     _probe_belief(ctx, 'final', rel_names)
 
     # ──── Final Decision — confidence-weighted ────
@@ -1470,12 +1601,6 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
         ans = prev_focused_answer
         rp.append(f"[final:evolution_stable_R{n_rounds}] {ans} (global={vl_global})")
         logger.info(f"  Final: evolution stable at R{n_rounds} → {ans} (global was {vl_global})")
-
-    elif converge_type == 'uncertainty_threshold':
-        # Mind-of-Thought: uncertainty-based convergence
-        ans = prev_focused_answer if prev_focused_answer else vl_global
-        rp.append(f"[final:uncertainty_threshold_R{n_rounds}] {ans}")
-        logger.info(f"  Final: uncertainty threshold at R{n_rounds} → {ans}")
 
     elif not all_valid:
         ans = 'A'
@@ -1509,13 +1634,14 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 class AgenticPipelineV21:
     def __init__(self, device='cuda:0', vl_model_path=None, max_rounds=3, grid_max_frames=128):
         self.device = device
-        self.vl_model_path = vl_model_path or '/home/tione/notebook/tianjungu/hf_cache/Qwen/Qwen3-VL-8B-Instruct'
+        self.vl_model_path = vl_model_path
         self.builder = Grid256Builder(device=device)
         self.vl = VLModel(device=device); self.max_rounds = max_rounds
         self.grid_max_frames = grid_max_frames
         self.abcd_ids = None  # Cached after model load
 
     def load_models(self):
+        self.vl_model_path = resolve_vl_model_path(self.vl_model_path)
         self.builder.load_models(); self.vl.load(self.vl_model_path)
         self.abcd_ids = _get_abcd_token_ids(self.vl.processor)
         logger.info(f"ABCD token IDs: {self.abcd_ids}")
@@ -1550,10 +1676,10 @@ class AgenticPipelineV21:
 
             # Mind-of-Thought: 计算 uncertainty reduction
             uncertainty_reduction = 0.0
-            if ctx.uncertainty_history:
-                first_unc = ctx.uncertainty_history[0].get('mean_query_uncertainty', 1.0)
-                last_unc = ctx.uncertainty_history[-1].get('mean_query_uncertainty', first_unc)
-                uncertainty_reduction = first_unc - last_unc
+            if len(ctx.uncertainty_history) >= 2:
+                initial_unc = ctx.uncertainty_history[0]['mean_query_uncertainty']
+                final_unc = ctx.uncertainty_history[-1]['mean_query_uncertainty']
+                uncertainty_reduction = initial_unc - final_unc
 
             results.append({
                 'scene_name': sample.get('scene_name', ''),
@@ -1576,11 +1702,11 @@ class AgenticPipelineV21:
                               for e in ctx.tool_trace],
                 'v7_vl_score': sample.get('vl_score', 0),
                 'v7_rule_score': sample.get('rule_score', 0),
-                # Mind-of-Thought: 新增字段
+                # Mind-of-Thought: Belief Probing + Uncertainty Fields
                 'belief_probe_history': ctx.belief_probe_history,
                 'focused_frame_history': ctx.focused_frame_history,
                 'uncertainty_history': ctx.uncertainty_history,
-                'mean_query_uncertainty': ctx.uncertainty_history[-1]['mean_query_uncertainty'] if ctx.uncertainty_history else 1.0,
+                'mean_query_uncertainty': ctx.uncertainty_history[-1]['mean_query_uncertainty'] if ctx.uncertainty_history else None,
                 'uncertainty_reduction': uncertainty_reduction,
                 'query_entities': ctx.query_entities,
             })
@@ -1649,9 +1775,19 @@ def _print_summary(all_results, od, ts):
 # Main Entry
 # ============================================================================
 
+def _resolve_output_dir(output_dir: Optional[str], gpu_id: Optional[int], timestamp: str) -> Path:
+    if output_dir:
+        base = Path(output_dir).expanduser()
+    elif gpu_id is not None:
+        base = PROJECT_ROOT / 'outputs' / 'agentic_pipeline_v21_run'
+    else:
+        base = PROJECT_ROOT / 'outputs' / f'agentic_pipeline_v21_{timestamp}'
+    return base / f'gpu{gpu_id}' if gpu_id is not None else base
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="V21 Confidence-Aware Self-Evolution Pipeline")
+    parser = argparse.ArgumentParser(description='V21 Confidence-Aware Self-Evolution Pipeline')
     parser.add_argument('--n_per_type', type=int, default=10)
     parser.add_argument('--full', action='store_true')
     parser.add_argument('--device', type=str, default='cuda:0')
@@ -1659,107 +1795,160 @@ def main():
     parser.add_argument('--num_gpus', type=int, default=8)
     parser.add_argument('--max_rounds', type=int, default=3)
     parser.add_argument('--grid_max_frames', type=int, default=128)
-    parser.add_argument('--vl-model', type=str, default='/home/tione/notebook/tianjungu/hf_cache/Qwen/Qwen3-VL-8B-Instruct')
+    parser.add_argument('--vl-model', type=str, default=None,
+                        help='Path to Qwen3-VL-8B-Instruct. Defaults to MOT_VL_MODEL or HF_HOME/Qwen/Qwen3-VL-8B-Instruct.')
     parser.add_argument('--vl-nframes', type=int, default=0, help='Override max nframes for VL calls (0=auto)')
+    parser.add_argument('--input_results', type=str, default=None,
+                        help='Evaluation manifest JSON. Defaults to data/eval_samples_v7_reference.json or MOT_INPUT_RESULTS.')
+    parser.add_argument('--video-dir', action='append', default=None,
+                        help='Video directory or VSIBench root. Can be passed multiple times.')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='Base output directory. Multi-GPU workers write to <output-dir>/gpu{gpu_id}.')
     args = parser.parse_args()
 
     if args.vl_nframes > 0:
         global VL_MAX_NFRAMES
         VL_MAX_NFRAMES = args.vl_nframes
-        logger.info(f"VL nframes capped to {VL_MAX_NFRAMES}")
+        logger.info(f'VL nframes capped to {VL_MAX_NFRAMES}')
 
     if args.gpu_id is not None:
         vis = os.environ.get('CUDA_VISIBLE_DEVICES', '')
         args.device = 'cuda:0' if vis else f'cuda:{args.gpu_id}'
 
-    v7_path = Path("/home/tione/notebook/tianjungu/projects/Spatial-Intelligence-MindCube/outputs/evolving_agent_v7_20260203_134612/detailed_results.json")
-    logger.info(f"Loading V7: {v7_path}")
-    with open(v7_path) as f: v7_results = json.load(f)
-    logger.info(f"V7: {len(v7_results)} samples")
+    if args.video_dir:
+        set_video_dirs(args.video_dir)
+
+    input_path = resolve_eval_manifest(args.input_results)
+    logger.info(f'Loading evaluation samples: {input_path}')
+    with open(input_path) as f:
+        eval_results = json.load(f)
+    logger.info(f'Evaluation manifest: {len(eval_results)} samples')
 
     if args.full:
-        test_samples = [s for s in v7_results if find_video_path(s['scene_name'])]
+        test_samples = [sample for sample in eval_results if find_video_path(sample['scene_name'])]
     else:
         by_type = defaultdict(list)
-        for r in v7_results: by_type[r['question_type']].append(r)
+        for result in eval_results:
+            by_type[result['question_type']].append(result)
         test_samples = []
-        for qt, samps in sorted(by_type.items()):
-            avail = [s for s in samps if find_video_path(s['scene_name'])]
-            n = min(args.n_per_type, len(avail))
+        for question_type, samples in sorted(by_type.items()):
+            available = [sample for sample in samples if find_video_path(sample['scene_name'])]
+            n = min(args.n_per_type, len(available))
             if n > 0:
-                for idx in np.linspace(0, len(avail)-1, n, dtype=int): test_samples.append(avail[idx])
-    logger.info(f"Test: {len(test_samples)} samples")
+                for idx in np.linspace(0, len(available) - 1, n, dtype=int):
+                    test_samples.append(available[idx])
+    logger.info(f'Selected {len(test_samples)} samples')
 
     by_scene = defaultdict(list)
-    for s in test_samples: by_scene[s['scene_name']].append(s)
+    for sample in test_samples:
+        by_scene[sample['scene_name']].append(sample)
     scene_list = sorted(by_scene.keys())
 
     if args.gpu_id is not None:
-        total = len(scene_list); chunk = (total + args.num_gpus - 1) // args.num_gpus
-        start = args.gpu_id * chunk; end = min(start + chunk, total)
+        total = len(scene_list)
+        chunk = (total + args.num_gpus - 1) // args.num_gpus if total else 0
+        start = args.gpu_id * chunk if chunk else 0
+        end = min(start + chunk, total) if chunk else 0
         my_scenes = scene_list[start:end]
-        logger.info(f"GPU {args.gpu_id}/{args.num_gpus}: {len(my_scenes)} scenes")
+        logger.info(f'GPU {args.gpu_id}/{args.num_gpus}: {len(my_scenes)} scenes')
     else:
         my_scenes = scene_list
 
-    vl_model = getattr(args, 'vl_model', None) or '/home/tione/notebook/tianjungu/hf_cache/Qwen/Qwen3-VL-8B-Instruct'
-    pipe = AgenticPipelineV21(device=args.device, vl_model_path=vl_model,
-                               max_rounds=args.max_rounds, grid_max_frames=args.grid_max_frames)
-    pipe.load_models()
+    all_results = []
+    total_scenes = len(my_scenes)
+    pipe = None
+    try:
+        if my_scenes:
+            pipe = AgenticPipelineV21(
+                device=args.device,
+                vl_model_path=args.vl_model,
+                max_rounds=args.max_rounds,
+                grid_max_frames=args.grid_max_frames,
+            )
+            pipe.load_models()
+        else:
+            logger.info('No scenes assigned to this worker; skipping model load.')
 
-    all_results = []; total_scenes = len(my_scenes)
-    for si, sn in enumerate(my_scenes):
-        samples = by_scene[sn]; vp = find_video_path(sn)
-        if not vp:
-            for s in samples:
-                all_results.append({'scene_name': sn, 'question_type': s['question_type'],
-                    'question': s['question'], 'ground_truth': s['ground_truth'],
-                    'options': s.get('options', []), 'prediction': '0', 'reasoning': 'no video',
-                    'score': 0.0, 'vl_calls': 0,
-                    'v7_vl_score': s.get('vl_score', 0), 'v7_rule_score': s.get('rule_score', 0)})
-            continue
-        logger.info(f"[{si+1}/{total_scenes}] {sn} ({len(samples)} q)")
-        try:
-            results = pipe.process_scene(vp, samples)
-            for r in results:
-                all_results.append(r)
-                d = r['score'] - r['v7_vl_score']; mk = "+" if d > 0 else ("-" if d < 0 else "=")
-                bm = "B!" if r.get('belief_modified') else "  "
-                logger.info(f"  {r['question_type'][:25]:25s} [VL:{r['vl_calls']} {bm}] "
-                    f"Score={r['score']:.3f} V7={r['v7_vl_score']:.3f} {mk} | "
-                    f"pred={str(r['prediction'])[:15]} gt={str(r['ground_truth'])[:12]} ({r['elapsed_s']:.0f}s)")
-        except Exception as e:
-            logger.error(f"  Error: {e}"); traceback.print_exc()
-            for s in samples:
-                all_results.append({'scene_name': sn, 'question_type': s['question_type'],
-                    'question': s['question'], 'ground_truth': s['ground_truth'],
-                    'options': s.get('options', []), 'prediction': '0',
-                    'reasoning': f'error: {str(e)[:100]}', 'score': 0.0, 'vl_calls': 0,
-                    'v7_vl_score': s.get('vl_score', 0), 'v7_rule_score': s.get('rule_score', 0)})
+        for scene_index, scene_name in enumerate(my_scenes):
+            samples = by_scene[scene_name]
+            video_path = find_video_path(scene_name)
+            if not video_path:
+                for sample in samples:
+                    all_results.append({
+                        'scene_name': scene_name,
+                        'question_type': sample['question_type'],
+                        'question': sample['question'],
+                        'ground_truth': sample['ground_truth'],
+                        'options': sample.get('options', []),
+                        'prediction': '0',
+                        'reasoning': 'no video',
+                        'score': 0.0,
+                        'vl_calls': 0,
+                        'v7_vl_score': sample.get('vl_score', 0),
+                        'v7_rule_score': sample.get('rule_score', 0),
+                    })
+                continue
 
-    pipe.unload()
+            logger.info(f'[{scene_index + 1}/{total_scenes}] {scene_name} ({len(samples)} q)')
+            try:
+                results = pipe.process_scene(video_path, samples)
+                for result in results:
+                    all_results.append(result)
+                    delta = result['score'] - result['v7_vl_score']
+                    marker = '+' if delta > 0 else ('-' if delta < 0 else '=')
+                    belief_marker = 'B!' if result.get('belief_modified') else '  '
+                    logger.info(
+                        f"  {result['question_type'][:25]:25s} [VL:{result['vl_calls']} {belief_marker}] "
+                        f"Score={result['score']:.3f} V7={result['v7_vl_score']:.3f} {marker} | "
+                        f"pred={str(result['prediction'])[:15]} gt={str(result['ground_truth'])[:12]} "
+                        f"({result['elapsed_s']:.0f}s)"
+                    )
+            except Exception as exc:
+                logger.error(f'  Error: {exc}')
+                traceback.print_exc()
+                for sample in samples:
+                    all_results.append({
+                        'scene_name': scene_name,
+                        'question_type': sample['question_type'],
+                        'question': sample['question'],
+                        'ground_truth': sample['ground_truth'],
+                        'options': sample.get('options', []),
+                        'prediction': '0',
+                        'reasoning': f'error: {str(exc)[:100]}',
+                        'score': 0.0,
+                        'vl_calls': 0,
+                        'v7_vl_score': sample.get('vl_score', 0),
+                        'v7_rule_score': sample.get('rule_score', 0),
+                    })
+    finally:
+        if pipe is not None:
+            pipe.unload()
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if args.gpu_id is not None:
-        od = PROJECT_ROOT / "outputs" / "agentic_pipeline_v21_ref" / f"gpu{args.gpu_id}"
-    else:
-        od = PROJECT_ROOT / "outputs" / f"agentic_pipeline_v21_{timestamp}"
-    od.mkdir(parents=True, exist_ok=True)
+    output_dir = _resolve_output_dir(args.output_dir, args.gpu_id, timestamp)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    clean = []
-    for r in all_results:
-        cr = {}
-        for k, v in r.items():
-            if isinstance(v, (np.floating, np.integer)): cr[k] = float(v)
-            elif isinstance(v, np.ndarray): cr[k] = v.tolist()
-            else: cr[k] = v
-        clean.append(cr)
-    with open(od / "detailed_results.json", 'w') as f:
-        json.dump(clean, f, indent=2, ensure_ascii=False)
-    logger.info(f"Results: {od} ({len(all_results)} samples)")
+    clean_results = []
+    for result in all_results:
+        clean_result = {}
+        for key, value in result.items():
+            if isinstance(value, (np.floating, np.integer)):
+                clean_result[key] = float(value)
+            elif isinstance(value, np.ndarray):
+                clean_result[key] = value.tolist()
+            else:
+                clean_result[key] = value
+        clean_results.append(clean_result)
+
+    with open(output_dir / 'detailed_results.json', 'w') as handle:
+        json.dump(clean_results, handle, indent=2, ensure_ascii=False)
+    logger.info(f'Results: {output_dir} ({len(all_results)} samples)')
 
     if args.gpu_id is None:
-        _print_summary(all_results, str(od), timestamp)
+        if all_results:
+            _print_summary(all_results, str(output_dir), timestamp)
+        else:
+            logger.warning('No results were produced.')
 
 
 if __name__ == '__main__':

@@ -30,10 +30,15 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# 添加 DA3 路径
-DA3_PATH = Path(__file__).parent.parent.parent / "projects" / "Depth-Anything-3"
-if str(DA3_PATH) not in sys.path:
-    sys.path.insert(0, str(DA3_PATH / "src"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from runtime_config import resolve_da3_src_path
+
+DA3_SRC_PATH = resolve_da3_src_path()
+if DA3_SRC_PATH is not None and str(DA3_SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(DA3_SRC_PATH))
 
 
 @dataclass
@@ -192,7 +197,10 @@ class DA3FullEstimator:
             
         except Exception as e:
             logger.error(f"DA3 模型加载失败: {e}")
-            raise
+            raise RuntimeError(
+                "Failed to load Depth-Anything-3. Set MOT_DA3_ROOT or MOT_DA3_SRC in config/local.env "
+                "or your shell environment, and ensure depth_anything_3 dependencies are installed."
+            ) from e
     
     @torch.no_grad()
     def estimate_multiview(
