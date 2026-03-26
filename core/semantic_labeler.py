@@ -139,7 +139,7 @@ class GroundingDINOLabeler:
         text_prompt: str = None,
     ) -> List[DetectionResult]:
         """
-        在图像中检测物体 (V21 ref 原始版本，无 NaN 检查)
+        在图像中检测物体（发布版原始实现，无 NaN 检查）
         """
         import torch
         from PIL import Image as PILImage

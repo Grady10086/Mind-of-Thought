@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-256³ Grid Mind Map — Agentic Pipeline V21 (Confidence-Aware Consensus)
+256³ Grid Mind Map — Mind of Thought Release Pipeline
 
-V21 = V20 + Break False Consensus:
-  V20 problem: 73% of choice samples reach "global consensus" at R1,
-  but 27% of those are FALSE consensus (both VL wrong, happen to agree).
-  V20 trusts consensus unconditionally → trapped.
+This release packages the final confidence-aware consensus pipeline:
+  The older consensus logic could get trapped when two wrong answers agreed.
+  This release keeps the confidence check and self-evolution loop that break
+  those false-consensus cases.
 
-  V21 solution: After detecting consensus, check LOGIT CONFIDENCE.
+  Release solution: After detecting consensus, check LOGIT CONFIDENCE.
   If confidence < threshold (0.6), DON'T trust → continue evolving.
   Only trust consensus when VL is actually confident.
 
@@ -51,7 +51,7 @@ if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-from scripts.grid64_real_test import (
+from scripts.mind_of_thought_baseline import (
     Grid64, GridEntity, Grid64Builder,
     EXTENDED_VOCABULARY, SYNONYMS, CALIBRATION_OBJECTS,
     _match_name, find_video_path, evaluate_sample, mean_relative_accuracy,
@@ -67,10 +67,10 @@ detect_task_type = None
 if USE_UNIFIED:
     try:
         from scripts.grid64_unified_pipeline import unified_grid_answer, detect_task_type
-        logger.info('[V21] Unified System enabled via USE_UNIFIED=true')
+        logger.info('[Release] Unified System enabled via USE_UNIFIED=true')
     except ImportError as exc:
         USE_UNIFIED = False
-        logger.warning('[V21] USE_UNIFIED requested but unavailable: %s', exc)
+        logger.warning('[Release] USE_UNIFIED requested but unavailable: %s', exc)
 
 # ============================================================================
 # Grid256 + fps-based builder (same as V17/V18)
@@ -634,7 +634,7 @@ def coder_tool(ctx, computation, **kwargs):
     grid = ctx.grid; c = computation.strip().lower()
     try:
         # === UNIFIED SYSTEM INTEGRATION (Choice Tasks Only) ===
-        # Only use Unified System for choice tasks, keep numeric tasks with original V21 logic
+        # Only use Unified System for choice tasks, keep numeric tasks with the release logic
         if USE_UNIFIED and unified_grid_answer is not None and c in ['direction', 'rel_distance', 'appearance_order', 'route']:
             try:
                 p, r = unified_grid_answer(grid, ctx.question, ctx.options, ctx.vl, ctx.video_path)
@@ -644,7 +644,7 @@ def coder_tool(ctx, computation, **kwargs):
                 logger.warning(f"Unified system failed for {c}: {ue}, falling back to original")
                 # Fall through to original implementation
         
-        # === ORIGINAL V21 IMPLEMENTATION ===
+        # === RELEASE IMPLEMENTATION ===
         if c == 'direction':
             p, r = grid_answer_direction(grid, ctx.question, ctx.options)
             ctx.tool_trace.append({'tool':'coder','comp':c,'result':p}); return f"Direction: answer={p}, detail={r}"
@@ -1168,7 +1168,7 @@ def _numerical_path(ctx, ct, rp):
 
 
 # ============================================================================
-# V21: Logit Confidence for Choice Questions
+# Release: Logit Confidence for Choice Questions
 # ============================================================================
 
 CONFIDENCE_THRESHOLD = 0.6  # Below this, don't trust consensus
@@ -1213,7 +1213,7 @@ def _compute_choice_confidence(model, processor, inputs):
 
 
 # ============================================================================
-# V21 CORE: Confidence-Aware Self-Evolution Loop (Choice Tasks)
+# Release Core: Confidence-Aware Self-Evolution Loop (Choice Tasks)
 # ============================================================================
 
 def _evolve_belief(ctx, rel_names, std_threshold, rp):
@@ -1447,10 +1447,10 @@ def _vl_on_frames_conf(ctx, frames, ents, ftype, is_temporal, rp, round_id, abcd
     return ans, conf_val, focused_pil
 
 
-def v21_loop(ctx, max_rounds=3, abcd_ids=None):
-    """Mind-of-Thought: V21 + Belief Probing + Uncertainty-Guided Evolution
+def belief_guided_loop(ctx, max_rounds=3, abcd_ids=None):
+    """Mind of Thought release loop with belief probing and uncertainty-guided evolution.
 
-    V21 baseline:
+    Release baseline:
     - P1 global VL call also gets logit confidence
     - Each focused VL call also gets logit confidence
     - When global==focused (consensus), check avg_conf
@@ -1631,7 +1631,7 @@ def v21_loop(ctx, max_rounds=3, abcd_ids=None):
 # Pipeline + Main
 # ============================================================================
 
-class AgenticPipelineV21:
+class MindOfThoughtPipeline:
     def __init__(self, device='cuda:0', vl_model_path=None, max_rounds=3, grid_max_frames=128):
         self.device = device
         self.vl_model_path = vl_model_path
@@ -1662,7 +1662,7 @@ class AgenticPipelineV21:
             t0 = time.time()
 
             try:
-                ans, reasoning = v21_loop(ctx, max_rounds=self.max_rounds, abcd_ids=self.abcd_ids)
+                ans, reasoning = belief_guided_loop(ctx, max_rounds=self.max_rounds, abcd_ids=self.abcd_ids)
             except Exception as e:
                 logger.error(f"  Error: {e}"); traceback.print_exc()
                 ans = 'A'; reasoning = f"[error] {e}"
@@ -1722,29 +1722,29 @@ class AgenticPipelineV21:
 
 def _print_summary(all_results, od, ts):
     print("\n" + "=" * 120)
-    print("Agentic Pipeline V21 — Confidence-Aware Self-Evolution")
+    print("Mind of Thought — Confidence-Aware Self-Evolution")
     print(f"Architecture: P0(Belief) → P1(Global VL+Conf) → Loop{{ Focus+Conf → ConfCheck → Evolve → ... }}")
     print(f"Unified fps={UNIFIED_FPS}, Grid max_frames={GRID_MAX_FRAMES}, max_rounds=3, conf_threshold={CONFIDENCE_THRESHOLD} | Samples: {len(all_results)}")
     print("=" * 120)
     tts = sorted(set(r['question_type'] for r in all_results))
-    print(f"  {'Task':<35} {'N':>4} {'V7':>6} {'V21':>6} {'Δ':>6}  {'VL':>4} {'Bel%':>4} {'Foc%':>4} {'AvgR':>4} {'T':>5}")
+    print(f"  {'Task':<35} {'N':>4} {'Ref':>6} {'MoT':>6} {'Δ':>6}  {'VL':>4} {'Bel%':>4} {'Foc%':>4} {'AvgR':>4} {'T':>5}")
     print("-" * 110)
     for qt in tts:
         qr = [r for r in all_results if r['question_type'] == qt]
-        v7 = np.mean([r.get('v7_vl_score', 0) for r in qr])
-        v21 = np.mean([r['score'] for r in qr])
-        d = v21 - v7; vl = np.mean([r.get('vl_calls', 0) for r in qr])
+        reference_score = np.mean([r.get('v7_vl_score', 0) for r in qr])
+        mot_score = np.mean([r['score'] for r in qr])
+        d = mot_score - reference_score; vl = np.mean([r.get('vl_calls', 0) for r in qr])
         bm = np.mean([1 if r.get('belief_modified') else 0 for r in qr]) * 100
         vf = np.mean([1 if r.get('vl_focused_used') else 0 for r in qr]) * 100
         avg_r = np.mean([r.get('converged_phase', 1) for r in qr])
         tavg = np.mean([r.get('elapsed_s', 0) for r in qr])
         mk = "+" if d > 0.01 else ("-" if d < -0.01 else "=")
-        print(f"  {qt:<35} {len(qr):>4} {v7:>5.3f} {v21:>5.3f} {d:>+5.3f}{mk} {vl:>4.1f} {bm:>3.0f}% {vf:>3.0f}% {avg_r:>3.1f} {tavg:>4.0f}s")
+        print(f"  {qt:<35} {len(qr):>4} {reference_score:>5.3f} {mot_score:>5.3f} {d:>+5.3f}{mk} {vl:>4.1f} {bm:>3.0f}% {vf:>3.0f}% {avg_r:>3.1f} {tavg:>4.0f}s")
 
-    ov7 = np.mean([r.get('v7_vl_score', 0) for r in all_results])
-    ov21 = np.mean([r['score'] for r in all_results])
+    ov_ref = np.mean([r.get('v7_vl_score', 0) for r in all_results])
+    ov_mot = np.mean([r['score'] for r in all_results])
     print("-" * 110)
-    print(f"  {'Overall':<35} {len(all_results):>4} {ov7:>5.3f} {ov21:>5.3f} {ov21-ov7:>+5.3f}")
+    print(f"  {'Overall':<35} {len(all_results):>4} {ov_ref:>5.3f} {ov_mot:>5.3f} {ov_mot-ov_ref:>+5.3f}")
 
     tvl = sum(r.get('vl_calls', 0) for r in all_results)
     avl = tvl / len(all_results) if all_results else 0
@@ -1758,14 +1758,14 @@ def _print_summary(all_results, od, ts):
     print(f"  Avg rounds: {avg_rounds:.1f}")
     print(f"  Belief Modified: {bm_n} ({100*bm_n/max(1,len(all_results)):.1f}%), VL Focused: {vf_n} ({100*vf_n/max(1,len(all_results)):.1f}%)")
 
-    summary = {'timestamp': ts, 'version': 'v21_confidence_aware_consensus', 'n_samples': len(all_results),
-               'overall': {'v7': float(ov7), 'v21': float(ov21), 'delta': float(ov21 - ov7)},
+    summary = {'timestamp': ts, 'version': 'mind_of_thought_release', 'n_samples': len(all_results),
+               'overall': {'reference': float(ov_ref), 'mind_of_thought': float(ov_mot), 'delta': float(ov_mot - ov_ref)},
                'avg_vl_calls': float(avl), 'avg_time_s': float(at),
                'convergence': {'converged': conv, 'avg_rounds': float(avg_rounds)},
                'belief_modified': bm_n, 'vl_focused': vf_n,
                'by_task': {qt: {'n': len([r for r in all_results if r['question_type'] == qt]),
-                                'v7': float(np.mean([r['v7_vl_score'] for r in all_results if r['question_type'] == qt])),
-                                'v21': float(np.mean([r['score'] for r in all_results if r['question_type'] == qt]))}
+                                'reference': float(np.mean([r['v7_vl_score'] for r in all_results if r['question_type'] == qt])),
+                                'mind_of_thought': float(np.mean([r['score'] for r in all_results if r['question_type'] == qt]))}
                            for qt in tts}}
     json.dump(summary, open(f"{od}/summary.json", 'w'), indent=2)
     return summary
@@ -1779,15 +1779,15 @@ def _resolve_output_dir(output_dir: Optional[str], gpu_id: Optional[int], timest
     if output_dir:
         base = Path(output_dir).expanduser()
     elif gpu_id is not None:
-        base = PROJECT_ROOT / 'outputs' / 'agentic_pipeline_v21_run'
+        base = PROJECT_ROOT / 'outputs' / 'mind_of_thought_run'
     else:
-        base = PROJECT_ROOT / 'outputs' / f'agentic_pipeline_v21_{timestamp}'
+        base = PROJECT_ROOT / 'outputs' / f'mind_of_thought_{timestamp}'
     return base / f'gpu{gpu_id}' if gpu_id is not None else base
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='V21 Confidence-Aware Self-Evolution Pipeline')
+    parser = argparse.ArgumentParser(description='Mind of Thought confidence-aware self-evolution pipeline')
     parser.add_argument('--n_per_type', type=int, default=10)
     parser.add_argument('--full', action='store_true')
     parser.add_argument('--device', type=str, default='cuda:0')
@@ -1799,7 +1799,7 @@ def main():
                         help='Path to Qwen3-VL-8B-Instruct. Defaults to MOT_VL_MODEL or HF_HOME/Qwen/Qwen3-VL-8B-Instruct.')
     parser.add_argument('--vl-nframes', type=int, default=0, help='Override max nframes for VL calls (0=auto)')
     parser.add_argument('--input_results', type=str, default=None,
-                        help='Evaluation manifest JSON. Defaults to data/eval_samples_v7_reference.json or MOT_INPUT_RESULTS.')
+                        help='Evaluation manifest JSON. Defaults to data/eval_samples.json or MOT_INPUT_RESULTS.')
     parser.add_argument('--video-dir', action='append', default=None,
                         help='Video directory or VSIBench root. Can be passed multiple times.')
     parser.add_argument('--output-dir', type=str, default=None,
@@ -1859,7 +1859,7 @@ def main():
     pipe = None
     try:
         if my_scenes:
-            pipe = AgenticPipelineV21(
+            pipe = MindOfThoughtPipeline(
                 device=args.device,
                 vl_model_path=args.vl_model,
                 max_rounds=args.max_rounds,

@@ -1,4 +1,4 @@
-# V21 Environment Summary
+# Release Environment Summary
 
 This repository was verified in the following environment:
 
@@ -29,14 +29,13 @@ The patch adds exception handling around the grid iteration logic so the Qwen3-V
 
 ```bash
 python3 -m py_compile runtime_config.py \
-  scripts/grid64_agentic_pipeline.py \
-  scripts/grid64_agentic_pipeline_v21.py \
-  scripts/grid64_real_test.py \
-  scripts/overall_results_parser.py \
+  scripts/mind_of_thought.py \
+  scripts/mind_of_thought_pipeline.py \
+  scripts/mind_of_thought_baseline.py \
+  scripts/results_parser.py \
   core/semantic_labeler.py
 
-python3 scripts/grid64_agentic_pipeline.py --help
-python3 scripts/grid64_real_test.py --help
-bash -n scripts/run_8gpu_agentic_parallel.sh
+python3 scripts/mind_of_thought.py --help
+python3 scripts/mind_of_thought_baseline.py --help
+bash -n scripts/run_parallel.sh
 ```
-

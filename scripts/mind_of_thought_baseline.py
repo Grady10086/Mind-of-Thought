@@ -9,7 +9,7 @@
 4. Grid工具确定性回答所有问题
 5. 对比 Grid工具 vs 参考 VL 分数
 
-对比基准: data/eval_samples_v7_reference.json (包含参考 VL / Rule 分数)
+对比基准: data/eval_samples.json (包含参考 VL / Rule 分数)
 """
 
 import os
@@ -1624,7 +1624,7 @@ def main():
     parser = argparse.ArgumentParser(description='Grid64 deterministic baseline')
     parser.add_argument('--n_per_type', type=int, default=10, help='Samples per task type')
     parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--input_results', type=str, default=None, help='Evaluation manifest JSON. Defaults to data/eval_samples_v7_reference.json.')
+    parser.add_argument('--input_results', type=str, default=None, help='Evaluation manifest JSON. Defaults to data/eval_samples.json.')
     parser.add_argument('--video-dir', action='append', default=None, help='Video directory or VSIBench root. Can be passed multiple times.')
     args = parser.parse_args()
 

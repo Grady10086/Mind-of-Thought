@@ -212,7 +212,7 @@ def print_summary(base: Path, source_kind: str, summary: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Parse Mind_of_Thought multi-GPU logs or detailed_results.json into summary metrics.')
+    parser = argparse.ArgumentParser(description='Parse Mind of Thought multi-GPU logs or detailed_results.json into summary metrics.')
     parser.add_argument('--base', type=str, default=None, help='Directory containing gpu*.log, gpu*/detailed_results.json, or a detailed_results.json file. Defaults to the latest outputs run.')
     parser.add_argument('--num_gpus', type=int, default=None, help='Expected number of GPU workers. Defaults to auto-detect from available sources.')
     args = parser.parse_args()

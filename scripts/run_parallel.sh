@@ -14,9 +14,9 @@ fi
 
 MODE="${1:-smoke}"
 NUM_GPUS="${NUM_GPUS:-8}"
-RUN_NAME="${RUN_NAME:-agentic_pipeline_v21_$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-mind_of_thought_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/$RUN_NAME}"
-INPUT_RESULTS="${INPUT_RESULTS:-${MOT_INPUT_RESULTS:-$ROOT_DIR/data/eval_samples_v7_reference.json}}"
+INPUT_RESULTS="${INPUT_RESULTS:-${MOT_INPUT_RESULTS:-$ROOT_DIR/data/eval_samples.json}}"
 VL_MODEL_ARG="${VL_MODEL:-${MOT_VL_MODEL:-}}"
 VIDEO_DIRS_ARG="${VIDEO_DIRS:-}"
 OVERWRITE="${OVERWRITE:-0}"
@@ -40,7 +40,7 @@ N_PER_TYPE="${N_PER_TYPE:-$DEFAULT_N_PER_TYPE}"
 
 if [[ ! -f "$INPUT_RESULTS" ]]; then
   echo "Input manifest not found: $INPUT_RESULTS" >&2
-  echo "Set INPUT_RESULTS/MOT_INPUT_RESULTS or place data/eval_samples_v7_reference.json in the repo." >&2
+  echo "Set INPUT_RESULTS/MOT_INPUT_RESULTS or place data/eval_samples.json in the repo." >&2
   exit 1
 fi
 
@@ -95,7 +95,7 @@ PIDS=()
 for gid in $(seq 0 $((NUM_GPUS - 1))); do
   LOG_PATH="$OUTPUT_DIR/gpu${gid}.log"
   (
-    CUDA_VISIBLE_DEVICES="$gid"     python3 "$SCRIPTS_DIR/grid64_agentic_pipeline.py"       --gpu_id "$gid"       --device "cuda:0"       "${COMMON_ARGS[@]}"       "${VIDEO_ARGS[@]}"
+    CUDA_VISIBLE_DEVICES="$gid"     python3 "$SCRIPTS_DIR/mind_of_thought.py"       --gpu_id "$gid"       --device "cuda:0"       "${COMMON_ARGS[@]}"       "${VIDEO_ARGS[@]}"
   ) > "$LOG_PATH" 2>&1 &
   PIDS+=("$!")
 done
@@ -104,4 +104,4 @@ echo "Waiting for all GPU workers..."
 wait "${PIDS[@]}"
 
 echo "Parsing overall results from logs..."
-python3 "$SCRIPTS_DIR/overall_results_parser.py" --base "$OUTPUT_DIR" --num_gpus "$NUM_GPUS"
+python3 "$SCRIPTS_DIR/results_parser.py" --base "$OUTPUT_DIR" --num_gpus "$NUM_GPUS"

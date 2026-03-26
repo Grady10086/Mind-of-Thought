@@ -109,16 +109,14 @@ def resolve_eval_manifest(path: Optional[str] = None) -> Path:
     env_path = os.environ.get('MOT_INPUT_RESULTS')
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    candidates.extend([
-        DATA_DIR / 'eval_samples_v7_reference.json',
-        DATA_DIR / 'eval_samples.json',
-    ])
+    candidates.append(DATA_DIR / 'eval_samples.json')
+    candidates.extend(sorted(DATA_DIR.glob('eval_samples*.json')))
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
     raise FileNotFoundError(
         'Could not find an evaluation manifest. Pass --input_results, set MOT_INPUT_RESULTS, '
-        'or place data/eval_samples_v7_reference.json in the repository.'
+        'or place data/eval_samples.json in the repository.'
     )
 
 
